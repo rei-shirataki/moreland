@@ -5,10 +5,13 @@
 //!   moreland                 watch for the tablet; stream whenever it is plugged in
 //!   moreland --once          stream one session, then exit
 //!   moreland --seconds N     stop after N seconds (implies --once, --stats)
+//!   moreland stop|start|status
+//!                            control the running daemon; see `control`
 //!
 //! Plug the tablet in and a virtual monitor appears; unplug it and the monitor
 //! disappears. No commands in between.
 
+mod control;
 mod inflight;
 mod output;
 mod session;
@@ -26,6 +29,8 @@ use tracker::DeviceTracker;
 /// `RestartSec` for as long as the session lasts.
 const EXIT_USAGE: i32 = 2;
 const EXIT_UNSUPPORTED: i32 = 3;
+/// Another daemon owns the control socket (and so the tablet).
+const EXIT_ALREADY_RUNNING: i32 = 4;
 
 #[derive(Debug)]
 struct Args {
@@ -39,6 +44,8 @@ struct Args {
 enum Command {
     Run(Args),
     Help,
+    /// Talk to the daemon that is already running.
+    Control(control::Request),
 }
 
 /// Parse the command line, rejecting anything not understood.
@@ -48,12 +55,23 @@ enum Command {
 /// chose — and `--fps abc` even marked it explicit, overriding device tuning.
 /// Both `--flag value` and `--flag=value` are accepted.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+    let mut args = args.into_iter().peekable();
+    if let Some(request) = args.peek().and_then(|a| control::Request::parse(a)) {
+        let word = args.next().unwrap();
+        if let Some(extra) = args.next() {
+            return Err(format!(
+                "`moreland {word}` takes no arguments, got {extra:?}"
+            ));
+        }
+        return Ok(Command::Control(request));
+    }
+
     let mut config = session::Config::default();
     let mut once = false;
     let mut seconds = None;
     let (mut width, mut height) = (None, None);
 
-    let mut it = args.into_iter();
+    let mut it = args;
     while let Some(arg) = it.next() {
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) if flag.starts_with("--") => {
@@ -173,6 +191,16 @@ fn main() -> Result<()> {
             println!("{}", include_str!("usage.txt"));
             return Ok(());
         }
+        Ok(Command::Control(request)) => match control::send(request) {
+            Ok(reply) => {
+                println!("{reply}");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("moreland: {e:#}");
+                std::process::exit(1);
+            }
+        },
         Err(e) => {
             eprintln!("moreland: {e}\nTry `moreland --help`.");
             std::process::exit(EXIT_USAGE);
@@ -192,21 +220,41 @@ fn main() -> Result<()> {
     tracing::info!("compositor: {}", compositor.name());
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    // Ends the current session only. `moreland stop` sets it alone; anything
+    // that sets `shutdown` sets it too.
+    let session_stop = Arc::new(AtomicBool::new(false));
 
     // SIGTERM matters here: systemd uses it to stop the service, and the
     // virtual output must come down cleanly or Hyprland is left with a
     // phantom monitor.
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, Arc::clone(&shutdown))?;
+        signal_hook::flag::register(signal, Arc::clone(&session_stop))?;
     }
 
     if let Some(seconds) = args.seconds {
         let shutdown = Arc::clone(&shutdown);
+        let session_stop = Arc::clone(&session_stop);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(seconds));
             shutdown.store(true, Ordering::Relaxed);
+            session_stop.store(true, Ordering::Relaxed);
         });
     }
+
+    let control = Arc::new(control::Control::new(Arc::clone(&session_stop)));
+    // A one-off run is not the daemon and does not answer `moreland stop`.
+    let _control_server = if args.once {
+        None
+    } else {
+        match control::serve(Arc::clone(&control)) {
+            Ok(server) => Some(server),
+            Err(e) => {
+                tracing::error!("{e:#}");
+                std::process::exit(EXIT_ALREADY_RUNNING);
+            }
+        }
+    };
 
     let mut tracker = DeviceTracker::connect()?;
     tracing::info!("watching for devices");
@@ -227,6 +275,7 @@ fn main() -> Result<()> {
         // list still stands.
         match tracker.next_update(Duration::from_millis(500)) {
             Ok(Some(update)) => {
+                control.observe(&update);
                 devices = update;
                 announced_idle = false;
                 consecutive_failures = 0;
@@ -247,13 +296,28 @@ fn main() -> Result<()> {
             }
         }
 
-        let Some(device) = devices.iter().find(|d| d.is_ready()).cloned() else {
+        let Some(device) = devices
+            .iter()
+            .find(|d| d.is_ready() && !control.is_stopped(&d.serial))
+            .cloned()
+        else {
             if !announced_idle {
                 if devices.is_empty() {
                     tracing::info!("no device connected");
                 } else {
                     for device in &devices {
-                        tracing::info!("device {} is {} — waiting", device.serial, device.state);
+                        if control.is_stopped(&device.serial) {
+                            tracing::info!(
+                                "device {} is stopped — reconnect it or run `moreland start`",
+                                device.serial
+                            );
+                        } else {
+                            tracing::info!(
+                                "device {} is {} — waiting",
+                                device.serial,
+                                device.state
+                            );
+                        }
                     }
                 }
                 announced_idle = true;
@@ -261,8 +325,17 @@ fn main() -> Result<()> {
             continue;
         };
 
+        if !control.begin(&device.serial) {
+            continue;
+        }
+        // `begin` cleared the session flag; a signal that landed just before
+        // it must still end this session.
+        if shutdown.load(Ordering::Relaxed) {
+            session_stop.store(true, Ordering::Relaxed);
+        }
         tracing::info!("device {} connected", device.serial);
-        let outcome = session::run(&device.serial, &args.config, &shutdown);
+        let outcome = session::run(&device.serial, &args.config, &session_stop);
+        let stopped_by_command = control.end();
 
         if args.once || shutdown.load(Ordering::Relaxed) {
             match outcome {
@@ -270,6 +343,17 @@ fn main() -> Result<()> {
                 Err(e) => tracing::warn!("session ended: {e:#}"),
             }
             break;
+        }
+
+        // Whatever the stop interrupted, it is not a failure to back off from.
+        if stopped_by_command {
+            if let Err(e) = outcome {
+                tracing::debug!("session ended while stopping: {e:#}");
+            }
+            tracing::info!("session stopped by command");
+            consecutive_failures = 0;
+            announced_idle = false;
+            continue;
         }
 
         match outcome {
@@ -363,6 +447,20 @@ mod tests {
         let args = run(&["--seconds", "15"]);
         assert_eq!(args.seconds, Some(15));
         assert!(args.once && args.config.stats);
+    }
+
+    #[test]
+    fn control_words_are_commands_only_on_their_own() {
+        assert!(matches!(
+            parse(&["stop"]),
+            Ok(Command::Control(control::Request::Stop))
+        ));
+        assert!(matches!(
+            parse(&["status"]),
+            Ok(Command::Control(control::Request::Status))
+        ));
+        assert!(parse(&["stop", "--fps", "60"]).is_err());
+        assert!(parse(&["--fps", "60", "start"]).is_err());
     }
 
     #[test]

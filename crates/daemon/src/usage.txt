@@ -2,6 +2,7 @@ moreland — turn a USB-connected Android tablet into a second monitor
 
 USAGE
     moreland [OPTIONS]
+    moreland stop | start | status
 
     With no options it runs as a daemon: plug the tablet in and a virtual
     monitor appears, unplug it and the monitor disappears.
@@ -35,6 +36,13 @@ OPTIONS
     --seconds <N>       stop after N seconds (implies --once and --stats)
     --stats             print round-trip latency statistics on exit
     -h, --help          show this help
+
+COMMANDS (for a daemon that is already running)
+    stop                stop streaming; the daemon keeps running, and the
+                        tablet stays stopped until it is unplugged and
+                        plugged back in, or until `moreland start`
+    start               resume streaming after `moreland stop`
+    status              show what the daemon is doing
 
 NOTES
     The tablet needs the companion app installed and USB debugging enabled.
