@@ -18,6 +18,21 @@ use crate::output::VirtualOutput;
 const APP_PACKAGE: &str = "com.moreland.display";
 const APP_ACTIVITY: &str = "com.moreland.display/.DisplayActivity";
 
+/// Frames allowed in flight (sent, not yet rendered and acknowledged).
+///
+/// Without a bound the host sends as fast as the compositor produces, and a
+/// decoder slower than that — the Kirin 659's MSVDX is — builds a standing
+/// queue in the socket and adb forward: a full-screen animation measured a
+/// 285 ms median round trip against 11 ms at best. Capping the pipeline and
+/// dropping the surplus *before* encoding keeps latency at roughly this many
+/// frame times instead, at the cost of showing fewer frames.
+const MAX_IN_FLIGHT: usize = 3;
+
+/// With no acknowledgement for this long, assume the device is not rendering
+/// (surface detached, app backgrounded) and stop gating on it. Frames are
+/// acked only when rendered, so without this the window would never reopen.
+const ACK_STALL: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Explicit resolution. `None` matches the device's own panel aspect ratio.
@@ -182,20 +197,44 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     std::thread::sleep(Duration::from_millis(2500));
 
     // Probe what this machine's encoder can actually import rather than
-    // assuming; the accepted modifier set is GPU-vendor specific.
-    let allowed_modifiers = encoder::supported_modifiers(capture::XR24);
-    tracing::debug!("encoder accepts modifiers {allowed_modifiers:02x?}");
+    // assuming; both the format and its modifiers are GPU-vendor specific.
+    // XR24 first — the output is opaque, so alpha is wasted work — then AR24,
+    // which is all Intel's iHD driver offers for 8-bit RGB (issue #3).
+    let mut allowed: Vec<(u32, Vec<u64>)> = [capture::XR24, capture::AR24]
+        .into_iter()
+        .filter_map(|f| encoder::supported_modifiers(f).map(|m| (f, m)))
+        .collect();
+    // Formats the encoder cannot import as DMA-BUF stay usable as a last
+    // resort: the encoder wraps a linear buffer as system memory instead
+    // (see `Encoder::new`). Listed after everything zero-copy, so they are
+    // only picked when the compositor offers nothing better.
+    for f in [capture::XR24, capture::AR24] {
+        if !allowed.iter().any(|(a, _)| *a == f) {
+            allowed.push((f, vec![0]));
+        }
+    }
+    tracing::debug!(
+        "consumer accepts {:02x?}",
+        allowed
+            .iter()
+            .map(|(f, m)| (capture::session::fourcc_name(*f), m))
+            .collect::<Vec<_>>()
+    );
 
     let mut capture = Capture::new(
         output.name(),
         &CaptureConfig {
             mode: BufferMode::Dmabuf,
             pool_size: 3,
-            allowed_modifiers,
-            allowed_formats: encoder::supported_dmabuf_formats(),
+            allowed_formats: allowed,
             paint_cursor: config.paint_cursor,
         },
     )?;
+    tracing::info!(
+        "capture format {} modifier 0x{:016x}",
+        capture::session::fourcc_name(capture.format),
+        capture.modifier.unwrap_or(0)
+    );
     let encoder = Arc::new(Encoder::new(&EncoderConfig {
         width: capture.width,
         height: capture.height,
@@ -216,8 +255,10 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let sent_at: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
     let round_trips: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+    let last_ack: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
     let ack_thread = {
+        let last_ack = Arc::clone(&last_ack);
         let mut reader = sender.ack_reader()?;
         let sent_at = Arc::clone(&sent_at);
         let round_trips = Arc::clone(&round_trips);
@@ -232,6 +273,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                         filled += n;
                         if filled == protocol::ACK_LEN {
                             filled = 0;
+                            *last_ack.lock().unwrap() = Instant::now();
                             if let Some(sent) = sent_at.lock().unwrap().pop_front() {
                                 round_trips.lock().unwrap().push(sent.elapsed());
                             }
@@ -280,14 +322,32 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
 
     let frame_duration_ns = 1_000_000_000u64 / u64::from(config.fps);
     let mut index = 0u64;
+    let mut dropped = 0u64;
     let result = (|| -> Result<()> {
         while !shutdown.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
             let timing = capture.capture_frame()?;
+            let slot = index;
+            index += 1;
+
+            // Shed load before encoding: a dropped source frame costs nothing,
+            // while one already queued toward a slow decoder is latency.
+            {
+                let mut in_flight = sent_at.lock().unwrap();
+                if in_flight.len() >= MAX_IN_FLIGHT {
+                    if last_ack.lock().unwrap().elapsed() < ACK_STALL {
+                        dropped += 1;
+                        continue;
+                    }
+                    // Nothing has been acknowledged for a while; forget the
+                    // stale entries so a recovering device is not gated on
+                    // frames that will never be acked.
+                    in_flight.clear();
+                }
+            }
             let dmabuf = capture
                 .dmabuf(timing.buffer_index)
                 .context("capture produced no DMA-BUF")?;
-            encoder.push_frame(dmabuf.planes[0].fd.as_fd(), dmabuf.planes[0].offset, dmabuf.planes[0].stride, index * frame_duration_ns)?;
-            index += 1;
+            encoder.push_frame(dmabuf.planes[0].fd.as_fd(), dmabuf.planes[0].offset, dmabuf.planes[0].stride, slot * frame_duration_ns)?;
         }
         Ok(())
     })();
@@ -299,7 +359,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     let _ = ack_thread.join();
 
     if config.stats {
-        report(&round_trips.lock().unwrap(), index, sender.bytes_sent());
+        report(&round_trips.lock().unwrap(), index, dropped, sender.bytes_sent());
     }
 
     // Leaving the app in the foreground with a dead socket is confusing; send
@@ -311,8 +371,9 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     result.and(send_result)
 }
 
-fn report(trips: &[Duration], frames: u64, bytes: u64) {
+fn report(trips: &[Duration], frames: u64, dropped: u64, bytes: u64) {
     println!("\n  frames captured   {frames}");
+    println!("  frames dropped    {dropped}  (kept under {MAX_IN_FLIGHT} in flight)");
     println!("  bytes sent        {:.1} MB", bytes as f64 / 1e6);
     println!("  acks received     {}", trips.len());
     if trips.is_empty() {
