@@ -155,6 +155,9 @@ object Protocol {
         y.toByte(),
     )
 
+    fun isTouchMove(message: ByteArray): Boolean =
+        message.size > 1 && message[0] == TAG_TOUCH.toByte() && message[1] == TOUCH_MOVE.toByte()
+
     fun encodeAck(ptsNs: Long): ByteArray = byteArrayOf(
         TAG_ACK.toByte(),
         (ptsNs ushr 56).toByte(),

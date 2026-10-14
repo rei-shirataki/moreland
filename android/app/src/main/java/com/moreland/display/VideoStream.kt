@@ -15,6 +15,7 @@ import java.io.IOException
 import java.io.OutputStream
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Accepts one host connection at a time on an abstract Unix socket, decodes the
@@ -55,11 +56,21 @@ class VideoStream(private val socketName: String) {
     /** Latest display size, resent at the start of every connection. */
     @Volatile private var displaySize: Pair<Int, Int>? = null
 
-    /** Contacts the host believes are down, so they can be lifted if the view goes away. */
+    /**
+     * Contacts the host believes are down, so they can be lifted if the view
+     * goes away. Also the lock for all touch state, [connected] included, so a
+     * touch is either wholly before a connection's reset or wholly after it.
+     */
     private val activeTouches = BooleanArray(Protocol.MAX_TOUCH_SLOTS)
 
+    /** Contacts whose latest move was shed, so the host has a stale position. */
+    private val movesShed = BooleanArray(Protocol.MAX_TOUCH_SLOTS)
+
+    /** Moves in [outgoing]; acks and other messages do not count toward shedding. */
+    private val queuedMoves = AtomicInteger()
+
     /** True only while a connection is being served; touches are dropped otherwise. */
-    @Volatile private var connected = false
+    private var connected = false
 
     @Volatile var framesDecoded: Long = 0; private set
     @Volatile var lastError: String? = null; private set
@@ -93,21 +104,45 @@ class VideoStream(private val socketName: String) {
      * the streamed image.
      */
     fun sendTouch(action: Int, slot: Int, x: Int, y: Int) {
-        if (!connected || slot !in 0 until Protocol.MAX_TOUCH_SLOTS) return
+        if (slot !in 0 until Protocol.MAX_TOUCH_SLOTS) return
         synchronized(activeTouches) {
+            if (!connected) return
             when (action) {
-                Protocol.TOUCH_DOWN -> activeTouches[slot] = true
+                Protocol.TOUCH_DOWN -> {
+                    activeTouches[slot] = true
+                    movesShed[slot] = false
+                }
                 Protocol.TOUCH_UP -> {
                     if (!activeTouches[slot]) return
                     activeTouches[slot] = false
+                    // Bring the host to where the finger left before lifting,
+                    // or a drag whose moves were shed ends where it began.
+                    if (movesShed[slot]) {
+                        movesShed[slot] = false
+                        offerMove(slot, x, y)
+                    }
                 }
-                else -> if (!activeTouches[slot]) return
+                else -> {
+                    if (!activeTouches[slot]) return
+                    // A move is superseded by the next one. Shed them rather
+                    // than let a stalled socket build a backlog that then
+                    // plays back as lag.
+                    if (queuedMoves.get() >= MAX_QUEUED_MOVES) {
+                        movesShed[slot] = true
+                        return
+                    }
+                    movesShed[slot] = false
+                    offerMove(slot, x, y)
+                    return
+                }
             }
+            outgoing.offer(Protocol.encodeTouch(action, slot, x, y))
         }
-        // A move is superseded by the next one. Shed them rather than let a
-        // stalled socket build a backlog that then plays back as lag.
-        if (action == Protocol.TOUCH_MOVE && outgoing.size > MAX_QUEUED_MOVES) return
-        outgoing.offer(Protocol.encodeTouch(action, slot, x, y))
+    }
+
+    private fun offerMove(slot: Int, x: Int, y: Int) {
+        queuedMoves.incrementAndGet()
+        outgoing.offer(Protocol.encodeTouch(Protocol.TOUCH_MOVE, slot, x, y))
     }
 
     /** Lift every contact the host still thinks is down. */
@@ -116,6 +151,7 @@ class VideoStream(private val socketName: String) {
             for (slot in activeTouches.indices) {
                 if (activeTouches[slot]) {
                     activeTouches[slot] = false
+                    movesShed[slot] = false
                     outgoing.offer(Protocol.encodeTouch(Protocol.TOUCH_UP, slot, 0, 0))
                 }
             }
@@ -215,15 +251,20 @@ class VideoStream(private val socketName: String) {
 
         val target = awaitSurface()
         freeInputs.clear()
-        outgoing.clear()
         // A new connection means a new injector on the host, with nothing down.
-        synchronized(activeTouches) { activeTouches.fill(false) }
+        // `connected` is still false here, so no touch can land in between.
+        synchronized(activeTouches) {
+            outgoing.clear()
+            queuedMoves.set(0)
+            activeTouches.fill(false)
+            movesShed.fill(false)
+        }
 
         var codec = configureCodec(header, target)
         this.codec = codec
         displaySize?.let { (w, h) -> outgoing.offer(Protocol.encodeOrientation(w, h)) }
         startAckWriter(output)
-        connected = true
+        synchronized(activeTouches) { connected = true }
 
         try {
             var scratch = ByteArray(256 * 1024)
@@ -263,7 +304,7 @@ class VideoStream(private val socketName: String) {
                 codec.queueInputBuffer(index, 0, frame.length, frame.ptsNs / 1000, flags)
             }
         } finally {
-            connected = false
+            synchronized(activeTouches) { connected = false }
             this.codec = null
             runCatching { codec.stop() }
             runCatching { codec.release() }
@@ -370,6 +411,7 @@ class VideoStream(private val socketName: String) {
             try {
                 while (running && !Thread.currentThread().isInterrupted) {
                     val message = outgoing.poll(500, TimeUnit.MILLISECONDS) ?: continue
+                    if (Protocol.isTouchMove(message)) queuedMoves.decrementAndGet()
                     output.write(message)
                     output.flush()
                 }
