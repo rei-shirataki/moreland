@@ -46,7 +46,8 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
         root.addView(status, FrameLayout.LayoutParams(MATCH, WRAP))
         setContentView(root)
 
-        stream = VideoStream().also { it.start() }
+        val socketName = Protocol.socketName(intent.getStringExtra(Protocol.SOCKET_EXTRA))
+        stream = VideoStream(socketName).also { it.start() }
         surfaceView.holder.addCallback(this)
         goImmersive()
     }
