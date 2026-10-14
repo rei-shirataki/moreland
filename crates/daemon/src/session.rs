@@ -5,7 +5,6 @@
 use anyhow::{bail, Context, Result};
 use capture::session::{BufferMode, Capture, CaptureConfig};
 use encoder::{Encoder, EncoderConfig};
-use std::collections::VecDeque;
 use std::io::Read;
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use transport::{adb, stream_header, Sender};
 
+use crate::inflight::InFlight;
 use crate::output::VirtualOutput;
 
 const APP_PACKAGE: &str = "com.moreland.display";
@@ -276,14 +276,14 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     tracing::info!("streaming to {serial}");
 
     let running = Arc::new(AtomicBool::new(true));
-    let sent_at: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let in_flight: Arc<Mutex<InFlight>> = Arc::new(Mutex::new(InFlight::default()));
     let round_trips: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
     let last_ack: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
     let ack_thread = {
         let last_ack = Arc::clone(&last_ack);
         let mut reader = sender.ack_reader()?;
-        let sent_at = Arc::clone(&sent_at);
+        let in_flight = Arc::clone(&in_flight);
         let round_trips = Arc::clone(&round_trips);
         let running = Arc::clone(&running);
         std::thread::spawn(move || {
@@ -296,9 +296,13 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                         filled += n;
                         if filled == protocol::ACK_LEN {
                             filled = 0;
-                            *last_ack.lock().unwrap() = Instant::now();
-                            if let Some(sent) = sent_at.lock().unwrap().pop_front() {
-                                round_trips.lock().unwrap().push(sent.elapsed());
+                            let now = Instant::now();
+                            *last_ack.lock().unwrap() = now;
+                            let rtt = protocol::decode_ack(&buf)
+                                .ok()
+                                .and_then(|pts| in_flight.lock().unwrap().ack(pts, now));
+                            if let Some(rtt) = rtt {
+                                round_trips.lock().unwrap().push(rtt);
                             }
                         }
                     }
@@ -320,12 +324,12 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     let drain_thread = {
         let encoder = Arc::clone(&encoder);
         let running = Arc::clone(&running);
-        let sent_at = Arc::clone(&sent_at);
+        let in_flight = Arc::clone(&in_flight);
         std::thread::spawn(move || -> (Sender, Result<()>) {
             while running.load(Ordering::Relaxed) {
                 match encoder.pull_packet(Duration::from_millis(100)) {
                     Ok(Some(p)) => {
-                        sent_at.lock().unwrap().push_back(Instant::now());
+                        in_flight.lock().unwrap().push(p.pts_ns, Instant::now());
                         if let Err(e) = sender.send_frame(&p.data, p.pts_ns, p.keyframe) {
                             running.store(false, Ordering::Relaxed);
                             return (sender, Err(e.into()));
@@ -355,7 +359,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
             // Shed load before encoding: a dropped source frame costs nothing,
             // while one already queued toward a slow decoder is latency.
             {
-                let mut in_flight = sent_at.lock().unwrap();
+                let mut in_flight = in_flight.lock().unwrap();
                 if in_flight.len() >= config.max_in_flight {
                     if last_ack.lock().unwrap().elapsed() < ACK_STALL {
                         dropped += 1;

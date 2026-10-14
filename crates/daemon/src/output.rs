@@ -237,47 +237,96 @@ fn lua_string(value: &str) -> String {
     escaped
 }
 
+/// Which config parser the running Hyprland uses; `hyprctl` speaks a
+/// different dialect to each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HyprParser {
+    /// The `.conf` format: `hyprctl keyword monitor <rule>`.
+    Legacy,
+    /// The Lua config (0.56+): `keyword` is refused, `hyprctl eval` is used.
+    Lua,
+}
+
+/// The `hyprctl` invocations that reassert every saved monitor except
+/// `excluded_output`, in the dialect `parser` accepts.
+///
+/// The Lua form must never reach a legacy-parser Hyprland, and `keyword` is
+/// refused by the Lua one, so the parser actually in use decides. Returns no
+/// commands when there is nothing to restore.
+fn hyprland_restore_commands(
+    states: &[MonitorState],
+    excluded_output: &str,
+    parser: HyprParser,
+) -> Vec<Vec<String>> {
+    let monitors: Vec<&MonitorState> = states
+        .iter()
+        .filter(|monitor| monitor.name != excluded_output)
+        .collect();
+
+    let refresh = |monitor: &MonitorState| {
+        format!("{:.6}", monitor.refresh_rate)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    };
+
+    match parser {
+        HyprParser::Legacy => monitors
+            .into_iter()
+            .map(|monitor| {
+                let rule = format!(
+                    "{},{}x{}@{},{}x{},{},transform,{}",
+                    monitor.name,
+                    monitor.width,
+                    monitor.height,
+                    refresh(monitor),
+                    monitor.x,
+                    monitor.y,
+                    monitor.scale,
+                    monitor.transform
+                );
+                vec!["keyword".to_string(), "monitor".to_string(), rule]
+            })
+            .collect(),
+        HyprParser::Lua => {
+            if monitors.is_empty() {
+                return Vec::new();
+            }
+            let lua = monitors
+                .into_iter()
+                .map(|monitor| {
+                    format!(
+                        "hl.monitor({{ output = {}, \
+                         mode = \"{}x{}@{}\", \
+                         position = \"{}x{}\", \
+                         scale = {}, \
+                         transform = {} }})",
+                        lua_string(&monitor.name),
+                        monitor.width,
+                        monitor.height,
+                        refresh(monitor),
+                        monitor.x,
+                        monitor.y,
+                        monitor.scale,
+                        monitor.transform
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            vec![vec!["eval".to_string(), lua]]
+        }
+    }
+}
+
 fn restore_hyprland_monitor_state(
     states: &[MonitorState],
     excluded_output: &str,
+    parser: HyprParser,
 ) -> Result<()> {
-    let mut lua = String::new();
-
-    for monitor in states {
-        if monitor.name == excluded_output {
-            continue;
-        }
-
-        let refresh = format!("{:.6}", monitor.refresh_rate)
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string();
-
-        let output = lua_string(&monitor.name);
-
-        lua.push_str(&format!(
-            "hl.monitor({{ output = {}, \
-             mode = \"{}x{}@{}\", \
-             position = \"{}x{}\", \
-             scale = {}, \
-             transform = {} }}); ",
-            output,
-            monitor.width,
-            monitor.height,
-            refresh,
-            monitor.x,
-            monitor.y,
-            monitor.scale,
-            monitor.transform
-        ));
+    for command in hyprland_restore_commands(states, excluded_output, parser) {
+        let args: Vec<&str> = command.iter().map(String::as_str).collect();
+        run("hyprctl", &args).context("restoring Hyprland monitor state")?;
     }
-
-    if lua.ends_with("; ") {
-        lua.truncate(lua.len() - 2);
-    }
-
-    run("hyprctl", &["eval", &lua]).context("restoring Hyprland monitor state")?;
-
     Ok(())
 }
 
@@ -338,6 +387,14 @@ impl VirtualOutput {
                     std::thread::sleep(std::time::Duration::from_millis(400));
                 }
 
+                // From here on the output exists, so hold it in the guard
+                // before anything else can fail: an early `?` past this
+                // point would otherwise leave a phantom monitor behind.
+                let output = Self {
+                    compositor,
+                    name: name.to_string(),
+                };
+
                 let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},1");
                 let reply = run("hyprctl", &["keyword", "monitor", &spec])
                     .with_context(|| format!("configuring output as {spec}"))?;
@@ -347,20 +404,25 @@ impl VirtualOutput {
                 // status, so `run` reports success and the output silently
                 // keeps the compositor's defaults. Re-issue the same rule
                 // through `eval`, which that parser does accept.
-                if reply.contains("non-legacy parsers") {
-                    let output = lua_string(name);
+                let parser = if reply.contains("non-legacy parsers") {
                     let lua = format!(
                         "hl.monitor({{ output = {}, \
                          mode = \"{width}x{height}@{refresh}\", \
                          position = \"{x}x{y}\", scale = 1 }})",
-                        output
+                        lua_string(name)
                     );
                     run("hyprctl", &["eval", &lua])
                         .with_context(|| format!("configuring output as {lua}"))?;
-                }
+                    HyprParser::Lua
+                } else {
+                    HyprParser::Legacy
+                };
 
-                restore_hyprland_monitor_state(&saved_states, name)
+                restore_hyprland_monitor_state(&saved_states, name, parser)
                     .context("restoring Hyprland monitor state")?;
+
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                return Ok(output);
             }
             // Sway is UNTESTED and everything else is unsupported; both cases
             // report themselves.
@@ -398,5 +460,74 @@ impl Drop for VirtualOutput {
             Ok(_) => tracing::debug!("removed output {}", self.name),
             Err(e) => tracing::warn!("failed to remove output {}: {e}", self.name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor(name: &str, x: i32, refresh_rate: f64, scale: f64) -> MonitorState {
+        MonitorState {
+            name: name.to_string(),
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            refresh_rate,
+            scale,
+            transform: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_parser_restores_through_keyword_never_eval() {
+        let states = [
+            monitor("DP-1", 0, 59.951, 1.0),
+            monitor("moreland", 1920, 60.0, 1.0),
+        ];
+        let commands = hyprland_restore_commands(&states, "moreland", HyprParser::Legacy);
+        assert_eq!(
+            commands,
+            vec![vec![
+                "keyword".to_string(),
+                "monitor".to_string(),
+                "DP-1,1920x1080@59.951,0x0,1,transform,0".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn lua_parser_restores_every_monitor_in_one_eval() {
+        let states = [
+            monitor("DP-1", 0, 60.0, 1.25),
+            monitor("moreland", 1920, 60.0, 1.0),
+            monitor("HDMI-A-1", 3840, 144.0, 1.0),
+        ];
+        let commands = hyprland_restore_commands(&states, "moreland", HyprParser::Lua);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0][0], "eval");
+        let lua = &commands[0][1];
+        assert!(lua.starts_with("hl.monitor({ output = \"DP-1\""), "{lua}");
+        assert!(lua.contains("scale = 1.25"), "{lua}");
+        assert!(
+            lua.contains("output = \"HDMI-A-1\", mode = \"1920x1080@144\""),
+            "{lua}"
+        );
+        assert!(!lua.contains("moreland"), "{lua}");
+        assert!(!lua.ends_with(';'), "{lua}");
+    }
+
+    #[test]
+    fn nothing_to_restore_issues_no_command() {
+        let states = [monitor("moreland", 0, 60.0, 1.0)];
+        for parser in [HyprParser::Legacy, HyprParser::Lua] {
+            assert!(hyprland_restore_commands(&states, "moreland", parser).is_empty());
+        }
+    }
+
+    #[test]
+    fn lua_string_escapes_quotes_and_backslashes() {
+        assert_eq!(lua_string(r#"a"b\c"#), r#""a\"b\\c""#);
     }
 }
