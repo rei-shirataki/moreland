@@ -214,49 +214,54 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         })
     };
 
-    let (packet_tx, packet_rx) = std::sync::mpsc::channel::<(Vec<u8>, u64, bool)>();
+    // The drain thread owns the sender: an encoded packet goes out the moment
+    // it exists. Sending from the capture loop instead held every packet until
+    // the *next* capture returned, which on a static screen is an arbitrarily
+    // long wait and on a busy one is up to a full frame of added latency.
     let drain_thread = {
         let encoder = Arc::clone(&encoder);
         let running = Arc::clone(&running);
-        std::thread::spawn(move || {
+        let sent_at = Arc::clone(&sent_at);
+        std::thread::spawn(move || -> (Sender, Result<()>) {
             while running.load(Ordering::Relaxed) {
                 match encoder.pull_packet(Duration::from_millis(100)) {
                     Ok(Some(p)) => {
-                        if packet_tx.send((p.data, p.pts_ns, p.keyframe)).is_err() {
-                            break;
+                        sent_at.lock().unwrap().push_back(Instant::now());
+                        if let Err(e) = sender.send_frame(&p.data, p.pts_ns, p.keyframe) {
+                            running.store(false, Ordering::Relaxed);
+                            return (sender, Err(e.into()));
                         }
                     }
                     Ok(None) => continue,
                     Err(e) => {
                         tracing::error!("encoder: {e}");
-                        break;
+                        running.store(false, Ordering::Relaxed);
+                        return (sender, Err(e));
                     }
                 }
             }
+            (sender, Ok(()))
         })
     };
 
     let frame_duration_ns = 1_000_000_000u64 / u64::from(config.fps);
     let mut index = 0u64;
     let result = (|| -> Result<()> {
-        while !shutdown.load(Ordering::Relaxed) {
+        while !shutdown.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
             let timing = capture.capture_frame()?;
             let dmabuf = capture
                 .dmabuf(timing.buffer_index)
                 .context("capture produced no DMA-BUF")?;
             encoder.push_frame(dmabuf.planes[0].fd.as_fd(), dmabuf.planes[0].offset, dmabuf.planes[0].stride, index * frame_duration_ns)?;
             index += 1;
-
-            while let Ok((data, pts, keyframe)) = packet_rx.try_recv() {
-                sent_at.lock().unwrap().push_back(Instant::now());
-                sender.send_frame(&data, pts, keyframe)?;
-            }
         }
         Ok(())
     })();
 
     running.store(false, Ordering::Relaxed);
-    let _ = drain_thread.join();
+    let (sender, send_result) = drain_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("send thread panicked"))?;
     let _ = ack_thread.join();
 
     if config.stats {
@@ -269,7 +274,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
 
     drop(forward);
     drop(output);
-    result
+    result.and(send_result)
 }
 
 fn report(trips: &[Duration], frames: u64, bytes: u64) {
