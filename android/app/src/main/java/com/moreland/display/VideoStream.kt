@@ -49,7 +49,10 @@ class VideoStream(private val socketName: String) {
     private var ackThread: Thread? = null
 
     private val freeInputs = LinkedBlockingQueue<Int>()
-    private val pendingAcks = LinkedBlockingQueue<Long>()
+    /** Encoded device-to-host messages, written by one thread so they never interleave. */
+    private val outgoing = LinkedBlockingQueue<ByteArray>()
+    /** Latest display size, resent at the start of every connection. */
+    @Volatile private var displaySize: Pair<Int, Int>? = null
 
     @Volatile var framesDecoded: Long = 0; private set
     @Volatile var lastError: String? = null; private set
@@ -74,6 +77,16 @@ class VideoStream(private val socketName: String) {
             runCatching { codec.setOutputSurface(surface) }
                 .onFailure { Log.w(TAG, "setOutputSurface failed: ${it.message}") }
         }
+    }
+
+    /**
+     * Tell the host the display is now this size, so it can resize the virtual
+     * output to match. Safe to call at any time; the latest size is also sent
+     * when a host connects.
+     */
+    fun reportDisplaySize(width: Int, height: Int) {
+        displaySize = width to height
+        if (client != null) outgoing.offer(Protocol.encodeOrientation(width, height))
     }
 
     fun start() {
@@ -159,16 +172,32 @@ class VideoStream(private val socketName: String) {
 
         val target = awaitSurface()
         freeInputs.clear()
-        pendingAcks.clear()
+        outgoing.clear()
 
-        val codec = configureCodec(header, target)
+        var codec = configureCodec(header, target)
         this.codec = codec
+        displaySize?.let { (w, h) -> outgoing.offer(Protocol.encodeOrientation(w, h)) }
         startAckWriter(output)
 
         try {
             var scratch = ByteArray(256 * 1024)
             while (running) {
-                val frame = Protocol.readFrameHeader(input)
+                val frame = when (val next = Protocol.readMessage(input)) {
+                    is Protocol.Message.Frame -> next.header
+                    is Protocol.Message.Header -> {
+                        // The host resized the picture; the next frame it
+                        // sends is a keyframe from a new encoder.
+                        val h = next.header
+                        Log.i(TAG, "stream ${h.width}x${h.height}@${h.framerate} ${h.mime}")
+                        this.codec = null
+                        runCatching { codec.stop() }
+                        runCatching { codec.release() }
+                        freeInputs.clear()
+                        codec = configureCodec(h, awaitSurface())
+                        this.codec = codec
+                        continue
+                    }
+                }
                 if (frame.length > scratch.size) {
                     scratch = ByteArray(frame.length)
                 }
@@ -261,7 +290,7 @@ class VideoStream(private val socketName: String) {
                     runCatching { codec.releaseOutputBuffer(index, render) }
                     if (render) {
                         framesDecoded++
-                        pendingAcks.offer(info.presentationTimeUs * 1000)
+                        outgoing.offer(Protocol.encodeAck(info.presentationTimeUs * 1000))
                     }
                 }
 
@@ -293,8 +322,8 @@ class VideoStream(private val socketName: String) {
         ackThread = Thread({
             try {
                 while (running && !Thread.currentThread().isInterrupted) {
-                    val pts = pendingAcks.poll(500, TimeUnit.MILLISECONDS) ?: continue
-                    output.write(Protocol.encodeAck(pts))
+                    val message = outgoing.poll(500, TimeUnit.MILLISECONDS) ?: continue
+                    output.write(message)
                     output.flush()
                 }
             } catch (e: Exception) {

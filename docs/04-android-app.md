@@ -251,3 +251,13 @@ the **largest remaining controllable term**, and the obvious Stage 6 target.
 
 Within the 35–45 ms committed in the architecture review. 32.6 ms of the budget
 is now measured rather than estimated.
+
+## Rotation
+
+The activity is `fullUser`, so it follows the tablet's rotation (and the
+system rotation lock). On every surface or configuration change it reports the
+real display size to the host as an *orientation* message (protocol v2, see
+`crates/protocol`). The host answers by resizing its virtual output, rebuilding
+capture and encoder, and sending a fresh stream header between frames; the app
+recognises it by its magic, reconfigures `MediaCodec` on the same surface and
+carries on from the next keyframe. The socket and the app stay up throughout.

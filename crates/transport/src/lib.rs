@@ -44,6 +44,17 @@ impl Sender {
         Ok(sender)
     }
 
+    /// Announce a new picture size between frames. The device reconfigures its
+    /// decoder; the next frame sent must be a keyframe.
+    pub fn send_header(&mut self, header: &StreamHeader) -> Result<()> {
+        let encoded = header.encode();
+        self.stream
+            .write_all(&encoded)
+            .context("sending stream header")?;
+        self.bytes_sent += encoded.len() as u64;
+        Ok(())
+    }
+
     /// Send one access unit. Header and payload go out in a single vectored
     /// write so they cannot be split into separate segments.
     pub fn send_frame(&mut self, payload: &[u8], pts_ns: u64, keyframe: bool) -> Result<()> {

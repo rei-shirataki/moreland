@@ -165,11 +165,20 @@ pub fn display_size(serial: &str) -> Result<(u32, u32)> {
 /// but it turns the extremely common 1080 into 1088 and breaks 16:9 exactly
 /// where it matters — H.264 pads to macroblocks internally and signals the crop
 /// in the SPS, so this is the encoder's problem, not ours.
+///
+/// `max_width` bounds the **longer** edge, so a portrait panel is capped the
+/// same as its landscape orientation.
 pub fn stream_resolution(panel: (u32, u32), max_width: u32) -> (u32, u32) {
     let (pw, ph) = panel;
-    let width = pw.min(max_width).max(2);
-    let height = ((u64::from(width) * u64::from(ph)) / u64::from(pw)) as u32;
-    (align2(width), align2(height.max(2)))
+    let long = pw.max(ph);
+    let scale = |v: u32| -> u32 {
+        if long <= max_width {
+            v
+        } else {
+            ((u64::from(v) * u64::from(max_width)) / u64::from(long)) as u32
+        }
+    };
+    (align2(scale(pw).max(2)), align2(scale(ph).max(2)))
 }
 
 fn align2(value: u32) -> u32 {
@@ -192,6 +201,12 @@ mod tests {
     fn scales_16_10_panel_cleanly() {
         // Xiaomi Pad 6: 2880x1800 -> exactly 1920x1200, a clean 1.5x upscale.
         assert_eq!(stream_resolution((2880, 1800), 1920), (1920, 1200));
+    }
+
+    #[test]
+    fn portrait_is_the_landscape_result_turned() {
+        assert_eq!(stream_resolution((1800, 2880), 1920), (1200, 1920));
+        assert_eq!(stream_resolution((800, 1280), 1920), (800, 1280));
     }
 
     #[test]
