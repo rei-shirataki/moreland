@@ -165,3 +165,12 @@ crates/daemon/
 systemd/moreland.service
 install.sh
 ```
+
+## Rotation
+
+When the tablet reports a new display size, the session tears down capture and
+encoder, calls `VirtualOutput::resize` (Hyprland only — labwc keeps its output
+as configured, so rotation is ignored there and the stream stays as it was),
+rebuilds the pipeline at the new size and sends a new stream header. With
+`--width/--height` the explicit size is turned to match the orientation.
+`max_width` bounds the longer edge, so portrait is the landscape size turned.

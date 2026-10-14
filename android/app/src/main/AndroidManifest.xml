@@ -10,7 +10,7 @@
         <activity
             android:name=".DisplayActivity"
             android:exported="true"
-            android:screenOrientation="userLandscape"
+            android:screenOrientation="fullUser"
             android:resizeableActivity="false"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density|smallestScreenSize"
             android:showWhenLocked="true"

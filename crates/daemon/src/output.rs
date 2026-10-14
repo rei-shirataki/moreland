@@ -350,6 +350,10 @@ pub struct VirtualOutput {
     borrowed: Option<MonitorState>,
     /// Dialect for that restore; only meaningful on Hyprland.
     parser: HyprParser,
+    /// Refresh rate and position the mode was applied with, kept so a resize
+    /// reissues the same rule with only the size changed.
+    refresh: u32,
+    position: (i32, i32),
 }
 
 impl VirtualOutput {
@@ -387,6 +391,8 @@ impl VirtualOutput {
                     name: name.to_string(),
                     borrowed: None,
                     parser: HyprParser::Legacy,
+                    refresh,
+                    position: (x, y),
                 });
             }
             Compositor::Hyprland => {
@@ -423,6 +429,8 @@ impl VirtualOutput {
                     name: name.to_string(),
                     borrowed,
                     parser: HyprParser::Legacy,
+                    refresh,
+                    position: (x, y),
                 };
 
                 let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},1");
@@ -465,11 +473,43 @@ impl VirtualOutput {
             name: name.to_string(),
             borrowed: None,
             parser: HyprParser::Legacy,
+                    refresh,
+                    position: (x, y),
         })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Change the mode of the output while it stays in the layout, for a tablet
+    /// that was rotated. Returns false when this compositor leaves the output
+    /// alone (labwc), in which case the caller keeps the size it has.
+    pub fn resize(&self, width: u32, height: u32) -> Result<bool> {
+        if self.compositor != Compositor::Hyprland || self.borrowed.is_some() {
+            return Ok(false);
+        }
+        let (x, y) = self.position;
+        let refresh = self.refresh;
+        let name = &self.name;
+        match self.parser {
+            HyprParser::Legacy => {
+                let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},1");
+                run("hyprctl", &["keyword", "monitor", &spec])
+                    .with_context(|| format!("resizing output as {spec}"))?;
+            }
+            HyprParser::Lua => {
+                let lua = format!(
+                    "hl.monitor({{ output = {}, mode = \"{width}x{height}@{refresh}\", \
+                     position = \"{x}x{y}\", scale = 1 }})",
+                    lua_string(name)
+                );
+                run("hyprctl", &["eval", &lua])
+                    .with_context(|| format!("resizing output as {lua}"))?;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        Ok(true)
     }
 
     /// Whether the requested mode and position were actually applied. False on
