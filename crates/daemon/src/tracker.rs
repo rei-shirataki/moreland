@@ -15,10 +15,11 @@ use std::process::Command;
 use std::time::Duration;
 
 fn adb_server_addr() -> String {
-    let port = std::env::var("ANDROID_ADB_SERVER_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(5037);
+    server_addr_for(std::env::var("ANDROID_ADB_SERVER_PORT").ok().as_deref())
+}
+
+fn server_addr_for(port: Option<&str>) -> String {
+    let port = port.and_then(|p| p.parse::<u16>().ok()).unwrap_or(5037);
     format!("127.0.0.1:{port}")
 }
 
@@ -47,22 +48,16 @@ pub struct DeviceTracker {
 impl DeviceTracker {
     pub fn connect() -> Result<Self> {
         let adb_bin = std::env::var("MORELAND_ADB").unwrap_or_else(|_| "adb".into());
-        // Idempotent; brings the server up if this is the first client.
-        let mut child = Command::new(&adb_bin)
-            .arg("start-server")
-            .spawn()
-            .with_context(|| format!("spawning `{adb_bin} start-server`"))?;
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(_status) = child.try_wait()? {
-                break;
-            }
-            if start.elapsed() >= Duration::from_secs(5) {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("adb start-server timed out after 5s");
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        // Idempotent; brings the server up if this is the first client. A
+        // failure here is not fatal: the server may already be listening even
+        // when `adb` itself is not on this unit's PATH, and the connect below
+        // is what decides. Output is captured so adb's "daemon not running;
+        // starting now" chatter stays out of the journal.
+        if let Err(e) = transport::process::run_with_timeout(
+            Command::new(&adb_bin).arg("start-server"),
+            Duration::from_secs(5),
+        ) {
+            tracing::debug!("`{adb_bin} start-server`: {e:#}");
         }
 
         let addr = adb_server_addr();
@@ -218,6 +213,8 @@ mod tests {
 
     #[test]
     fn parses_default_adb_server_addr() {
-        assert_eq!(adb_server_addr(), "127.0.0.1:5037");
+        assert_eq!(server_addr_for(None), "127.0.0.1:5037");
+        assert_eq!(server_addr_for(Some("5038")), "127.0.0.1:5038");
+        assert_eq!(server_addr_for(Some("not-a-port")), "127.0.0.1:5037");
     }
 }

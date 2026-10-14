@@ -5,6 +5,9 @@ members = ["crates/capture", "crates/encoder", "crates/protocol", "crates/transp
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Set by gstreamer-rs 0.25. Distribution rustc packages (Debian, Ubuntu LTS)
+# are older than this; install a toolchain with rustup instead.
+rust-version = "1.92"
 license = "Apache-2.0"
 
 [workspace.dependencies]

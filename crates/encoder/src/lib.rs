@@ -15,7 +15,6 @@
 
 use anyhow::{bail, Context, Result};
 use capture::dmabuf::Dmabuf;
-use capture::session::fourcc_name;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_allocators::prelude::*;
@@ -543,9 +542,23 @@ fn inspect_dmabuf(
     Ok((OwnedFd::from(file), (meta.dev(), meta.ino()), size))
 }
 
+/// A DRM fourcc as GStreamer spells it in `drm-format` caps: the four raw
+/// bytes, padding spaces included (`R8  `). Deliberately not
+/// `capture::session::fourcc_name`, whose hex fallback for unprintable bytes
+/// suits logs but would never match a caps string.
+fn fourcc_name(code: u32) -> String {
+    String::from_utf8_lossy(&code.to_le_bytes()).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caps_fourcc_keeps_padding_spaces() {
+        assert_eq!(fourcc_name(u32::from_le_bytes(*b"R8  ")), "R8  ");
+        assert_eq!(fourcc_name(u32::from_le_bytes(*b"XR24")), "XR24");
+    }
 
     /// `vapostproc`'s `memory:DMABuf` sink caps on Intel iHD 26.2.4, copied
     /// verbatim from the `GST_DEBUG` dump @camradex attached to issue #3

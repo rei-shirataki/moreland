@@ -17,6 +17,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::process::Command;
+use transport::process::run_with_timeout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compositor {
@@ -117,44 +118,10 @@ fn desktop_names(desktop: &str, wanted: &str) -> bool {
         .any(|name| name.trim().eq_ignore_ascii_case(wanted))
 }
 
-fn run_with_timeout(
-    mut cmd: Command,
-    timeout: std::time::Duration,
-) -> Result<std::process::Output> {
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut out) = child.stdout.take() {
-                std::io::Read::read_to_end(&mut out, &mut stdout)?;
-            }
-            if let Some(mut err) = child.stderr.take() {
-                std::io::Read::read_to_end(&mut err, &mut stderr)?;
-            }
-            return Ok(std::process::Output {
-                status,
-                stdout,
-                stderr,
-            });
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("command timed out after {timeout:?}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
 fn run(program: &str, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new(program);
     cmd.args(args);
-    let output = run_with_timeout(cmd, std::time::Duration::from_secs(5))
+    let output = run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
         .with_context(|| format!("running `{program} {}`", args.join(" ")))?;
     if !output.status.success() {
         bail!(
@@ -558,11 +525,14 @@ impl VirtualOutput {
     }
 
     /// Change the mode of the output while it stays in the layout, for a tablet
-    /// that was rotated. Returns false when this compositor leaves the output
-    /// alone (labwc), in which case the caller keeps the size it has.
-    pub fn resize(&self, width: u32, height: u32) -> Result<bool> {
-        if self.compositor != Compositor::Hyprland || self.borrowed.is_some() {
-            return Ok(false);
+    /// that was rotated. Only valid when [`can_resize`](Self::can_resize).
+    pub fn resize(&self, width: u32, height: u32) -> Result<()> {
+        if !self.can_resize() {
+            bail!(
+                "{} output {} cannot be resized",
+                self.compositor.name(),
+                self.name
+            );
         }
         let (x, y) = self.position;
         let refresh = self.refresh;
@@ -584,7 +554,7 @@ impl VirtualOutput {
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
-        Ok(true)
+        Ok(())
     }
 
     /// Whether the requested mode and position were actually applied. False on

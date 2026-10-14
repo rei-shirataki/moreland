@@ -312,8 +312,9 @@ sudo dnf install rust cargo gstreamer1-plugins-base gstreamer1-plugins-good \
                  gstreamer1-plugins-bad-free libva libva-utils android-tools \
                  wayland-utils
 
-# Debian / Ubuntu — UNVERIFIED, check GStreamer is 1.22+
-sudo apt install rustc cargo gstreamer1.0-plugins-base \
+# Debian / Ubuntu — UNVERIFIED, check GStreamer is 1.22+. The packaged rustc
+# is older than the Rust 1.92 this needs, so install Rust with rustup.
+sudo apt install gstreamer1.0-plugins-base \
                  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
                  libva2 vainfo adb wayland-utils
 ```

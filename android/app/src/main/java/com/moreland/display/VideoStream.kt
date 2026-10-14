@@ -343,9 +343,17 @@ class VideoStream(private val socketName: String) {
 
                 override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
                     lastError = e.message
+                    // A transient error (typically a resource briefly unavailable)
+                    // clears on its own; decoding carries on, as it did before.
+                    if (e.isTransient) {
+                        Log.w(TAG, "transient codec error: ${e.message}", e)
+                        return
+                    }
                     Log.e(TAG, "codec error: ${e.message}", e)
-                    // Abort the session so the host learns of the failure and the
-                    // app returns to listening for a clean reconnection.
+                    // Anything else needs the codec stopped and reconfigured at
+                    // the least (isRecoverable) or rebuilt. Reconnecting does
+                    // exactly that, so abort the session: the host learns of the
+                    // failure and the app returns to listening.
                     runCatching { client?.close() }
                 }
 

@@ -309,7 +309,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     // any half-read message in it) carries on across a resize.
     let alive = Arc::new(AtomicBool::new(true));
     let in_flight: Arc<Mutex<InFlight>> = Arc::new(Mutex::new(InFlight::default()));
-    let round_trips: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+    let round_trips: Arc<Mutex<RoundTrips>> = Arc::new(Mutex::new(RoundTrips::default()));
     let last_ack: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
     // The device's latest reported display size, until the loop acts on it.
     let reported: Arc<Mutex<Option<(u16, u16)>>> = Arc::new(Mutex::new(None));
@@ -372,10 +372,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                                                 in_flight.lock().unwrap().ack(pts_ns, now)
                                             {
                                                 if record_stats {
-                                                    let mut trips = round_trips.lock().unwrap();
-                                                    if trips.len() < 100_000 {
-                                                        trips.push(rtt);
-                                                    }
+                                                    round_trips.lock().unwrap().record(rtt);
                                                 }
                                             }
                                         }
@@ -506,7 +503,12 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                 if let Some(target) = wanted_size(size) {
                     return Ok(Exit::Resize(target));
                 }
-                let timing = capture.capture_frame()?;
+                let Some(timing) = capture.capture_frame_until(|| {
+                    shutdown.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed)
+                })?
+                else {
+                    break;
+                };
                 let slot = index;
                 index += 1;
 
@@ -565,11 +567,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         drop(capture);
         drop(encoder);
         let rebuilt = (|| -> Result<(Capture, Arc<Encoder>)> {
-            if !output.resize(target.0, target.1)? {
-                tracing::warn!(
-                    "compositor declined output resize; rebuilding pipeline with current size"
-                );
-            }
+            output.resize(target.0, target.1)?;
             build_pipeline()
         })();
         match rebuilt {
@@ -608,19 +606,49 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     final_result
 }
 
-fn report(trips: &[Duration], frames: u64, dropped: u64, max_in_flight: usize, bytes: u64) {
+/// Round-trip samples kept for `--stats`; about 28 minutes at 60 fps.
+const ROUND_TRIP_WINDOW: usize = 100_000;
+
+/// Round-trip times for `--stats`, bounded in memory. Once full, the oldest
+/// sample is overwritten, so a long session reports on its most recent stretch
+/// (where a late regression such as thermal throttling shows up) rather than
+/// on its first half hour.
+#[derive(Default)]
+struct RoundTrips {
+    samples: Vec<Duration>,
+    total: u64,
+}
+
+impl RoundTrips {
+    fn record(&mut self, rtt: Duration) {
+        if self.samples.len() < ROUND_TRIP_WINDOW {
+            self.samples.push(rtt);
+        } else {
+            self.samples[(self.total % ROUND_TRIP_WINDOW as u64) as usize] = rtt;
+        }
+        self.total += 1;
+    }
+}
+
+fn report(trips: &RoundTrips, frames: u64, dropped: u64, max_in_flight: usize, bytes: u64) {
     println!("\n  frames captured   {frames}");
     println!("  frames dropped    {dropped}  (kept under {max_in_flight} in flight)");
     println!("  bytes sent        {:.1} MB", bytes as f64 / 1e6);
-    println!("  acks received     {}", trips.len());
-    if trips.is_empty() {
+    println!("  acks received     {}", trips.total);
+    if trips.samples.is_empty() {
         println!("\n  no acknowledgements — check `adb logcat -s Moreland`");
         return;
     }
-    let mut trips = trips.to_vec();
+    let total = trips.total;
+    let mut trips = trips.samples.clone();
     trips.sort_unstable();
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-    println!("\n  round trip: host send -> device render -> host ack");
+    let scope = if trips.len() as u64 == total {
+        String::new()
+    } else {
+        format!(" (last {} acks)", trips.len())
+    };
+    println!("\n  round trip{scope}: host send -> device render -> host ack");
     println!("    min       {:>8.2} ms", ms(trips[0]));
     println!("    median    {:>8.2} ms", ms(trips[trips.len() / 2]));
     println!(
@@ -640,10 +668,8 @@ fn compute_wanted_size(
     if !can_resize {
         return None;
     }
+    // The ack reader only stores dimensions in 100..=10_000.
     let (w, h) = reported?;
-    if w == 0 || h == 0 {
-        return None;
-    }
     let portrait = h > w;
     let target = match config_resolution {
         Some((ew, eh)) => {
@@ -687,6 +713,21 @@ mod tests {
     fn wanted_size_detects_rotation_to_portrait() {
         let res = compute_wanted_size(true, Some((1200, 1920)), None, 1920, (1920, 1200));
         assert_eq!(res, Some((1200, 1920)));
+    }
+
+    #[test]
+    fn round_trips_keep_the_most_recent_window() {
+        let mut trips = RoundTrips::default();
+        for ms in 0..(ROUND_TRIP_WINDOW as u64 + 10) {
+            trips.record(Duration::from_millis(ms));
+        }
+        assert_eq!(trips.total, ROUND_TRIP_WINDOW as u64 + 10);
+        assert_eq!(trips.samples.len(), ROUND_TRIP_WINDOW);
+        // The ten oldest samples were overwritten by the ten newest.
+        assert!(!trips.samples.contains(&Duration::from_millis(9)));
+        assert!(trips
+            .samples
+            .contains(&Duration::from_millis(ROUND_TRIP_WINDOW as u64 + 9)));
     }
 
     #[test]
