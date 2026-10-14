@@ -3,6 +3,8 @@
 package com.moreland.display
 
 import android.app.Activity
+import android.content.res.Configuration
+import android.graphics.Point
 import android.graphics.Color
 import android.os.Bundle
 import android.view.MotionEvent
@@ -122,6 +124,20 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         stream?.setSurface(holder.surface)
+        reportDisplaySize()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        reportDisplaySize()
+    }
+
+    /** The host sizes its virtual output to this, so it follows rotation. */
+    @Suppress("DEPRECATION")
+    private fun reportDisplaySize() {
+        val size = Point()
+        windowManager.defaultDisplay.getRealSize(size)
+        if (size.x > 0 && size.y > 0) stream?.reportDisplaySize(size.x, size.y)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {

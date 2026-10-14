@@ -263,43 +263,56 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
             .collect::<Vec<_>>()
     );
 
-    let mut capture = Capture::new(
-        output.name(),
-        &CaptureConfig {
-            mode: BufferMode::Dmabuf,
-            pool_size: 3,
-            allowed_formats: allowed,
-            paint_cursor: config.paint_cursor,
-        },
-    )?;
-    tracing::info!(
-        "capture format {} modifier 0x{:016x}",
-        capture::session::fourcc_name(capture.format),
-        capture.modifier.unwrap_or(0)
-    );
-    let encoder = Arc::new(Encoder::new(&EncoderConfig {
-        width: capture.width,
-        height: capture.height,
-        framerate: config.fps,
-        bitrate_kbps: config.bitrate_kbps,
-        cabac: config.cabac,
-        target_usage: config.target_usage,
-        fourcc: capture.format,
-        modifier: capture.modifier.unwrap_or(0),
-        ..Default::default()
-    })?);
+    let build_pipeline = || -> Result<(Capture, Arc<Encoder>)> {
+        let capture = Capture::new(
+            output.name(),
+            &CaptureConfig {
+                mode: BufferMode::Dmabuf,
+                pool_size: 3,
+                allowed_formats: allowed.clone(),
+                paint_cursor: config.paint_cursor,
+            },
+        )?;
+        tracing::info!(
+            "capture {}x{} format {} modifier 0x{:016x}",
+            capture.width,
+            capture.height,
+            capture::session::fourcc_name(capture.format),
+            capture.modifier.unwrap_or(0)
+        );
+        let encoder = Arc::new(Encoder::new(&EncoderConfig {
+            width: capture.width,
+            height: capture.height,
+            framerate: config.fps,
+            bitrate_kbps: config.bitrate_kbps,
+            cabac: config.cabac,
+            target_usage: config.target_usage,
+            fourcc: capture.format,
+            modifier: capture.modifier.unwrap_or(0),
+            ..Default::default()
+        })?);
+        Ok((capture, encoder))
+    };
 
-    let mut sender = Sender::connect(
+    let (mut capture, mut encoder) = build_pipeline()?;
+    let mut size = (capture.width, capture.height);
+
+    let sender = Sender::connect(
         port,
         &stream_header(capture.width, capture.height, config.fps)?,
     )
     .context("connecting to the app — is it in the foreground on the tablet?")?;
     tracing::info!("streaming to {serial}");
 
-    let running = Arc::new(AtomicBool::new(true));
+    // `alive` spans the whole session; `running` is per pipeline, so the
+    // threads that belong to one encoder can stop while the ack reader (and
+    // any half-read message in it) carries on across a resize.
+    let alive = Arc::new(AtomicBool::new(true));
     let in_flight: Arc<Mutex<InFlight>> = Arc::new(Mutex::new(InFlight::default()));
     let round_trips: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
     let last_ack: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+    // The device's latest reported display size, until the loop acts on it.
+    let reported: Arc<Mutex<Option<(u16, u16)>>> = Arc::new(Mutex::new(None));
 
     // Created after the output exists so the compositor can bind the device to
     // it. Touch is optional: without /dev/uinput access the display still works.
@@ -333,13 +346,14 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         let mut reader = sender.ack_reader()?;
         let in_flight = Arc::clone(&in_flight);
         let round_trips = Arc::clone(&round_trips);
-        let running = Arc::clone(&running);
+        let alive = Arc::clone(&alive);
+        let reported = Arc::clone(&reported);
         std::thread::spawn(move || {
-            // Messages are small and fixed-length per tag; a reply can arrive
+            // Messages are small and fixed-length per tag; one can arrive
             // split across reads, so keep what has not parsed yet.
             let mut pending: Vec<u8> = Vec::with_capacity(256);
             let mut chunk = [0u8; 256];
-            'read: while running.load(Ordering::Relaxed) {
+            'read: while alive.load(Ordering::Relaxed) {
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -353,10 +367,14 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                                         protocol::DeviceMessage::Ack { pts_ns } => {
                                             let now = Instant::now();
                                             *last_ack.lock().unwrap() = now;
-                                            let rtt = in_flight.lock().unwrap().ack(pts_ns, now);
-                                            if let Some(rtt) = rtt {
+                                            if let Some(rtt) =
+                                                in_flight.lock().unwrap().ack(pts_ns, now)
+                                            {
                                                 round_trips.lock().unwrap().push(rtt);
                                             }
+                                        }
+                                        protocol::DeviceMessage::Orientation { width, height } => {
+                                            *reported.lock().unwrap() = Some((width, height));
                                         }
                                         protocol::DeviceMessage::Touch(event) => {
                                             if let Some(injector) = touch_in.as_mut() {
@@ -389,72 +407,166 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         })
     };
 
-    // The drain thread owns the sender: an encoded packet goes out the moment
-    // it exists. Sending from the capture loop instead held every packet until
-    // the *next* capture returned, which on a static screen is an arbitrarily
-    // long wait and on a busy one is up to a full frame of added latency.
-    let drain_thread = {
-        let encoder = Arc::clone(&encoder);
-        let running = Arc::clone(&running);
-        let in_flight = Arc::clone(&in_flight);
-        std::thread::spawn(move || -> (Sender, Result<()>) {
-            while running.load(Ordering::Relaxed) {
-                match encoder.pull_packet(Duration::from_millis(100)) {
-                    Ok(Some(p)) => {
-                        in_flight.lock().unwrap().push(p.pts_ns, Instant::now());
-                        if let Err(e) = sender.send_frame(&p.data, p.pts_ns, p.keyframe) {
-                            running.store(false, Ordering::Relaxed);
-                            return (sender, Err(e.into()));
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::error!("encoder: {e}");
-                        running.store(false, Ordering::Relaxed);
-                        return (sender, Err(e));
-                    }
-                }
+    // The size the picture should have for the device's reported display, or
+    // `None` when it is already that size.
+    let wanted_size = |size: (u32, u32)| -> Option<(u32, u32)> {
+        let (w, h) = (*reported.lock().unwrap())?;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let portrait = h > w;
+        let target = match config.resolution {
+            Some((ew, eh)) => {
+                let (long, short) = (ew.max(eh), ew.min(eh));
+                if portrait { (short, long) } else { (long, short) }
             }
-            (sender, Ok(()))
-        })
+            None => adb::stream_resolution((u32::from(w), u32::from(h)), config.max_width),
+        };
+        (target != size).then_some(target)
     };
+
+    enum Exit {
+        Stopped,
+        Resize((u32, u32)),
+    }
 
     let frame_duration_ns = 1_000_000_000u64 / u64::from(config.fps);
     let mut index = 0u64;
     let mut dropped = 0u64;
-    let result = (|| -> Result<()> {
-        while !shutdown.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
-            let timing = capture.capture_frame()?;
-            let slot = index;
-            index += 1;
+    let mut sender = Some(sender);
+    let final_result: Result<()>;
 
-            // Shed load before encoding: a dropped source frame costs nothing,
-            // while one already queued toward a slow decoder is latency.
-            {
-                let mut in_flight = in_flight.lock().unwrap();
-                if in_flight.len() >= config.max_in_flight {
-                    if last_ack.lock().unwrap().elapsed() < ACK_STALL {
-                        dropped += 1;
-                        continue;
+    loop {
+        let running = Arc::new(AtomicBool::new(true));
+
+        // The drain thread owns the sender: an encoded packet goes out the
+        // moment it exists. Sending from the capture loop instead held every
+        // packet until the *next* capture returned, which on a static screen is
+        // an arbitrarily long wait and on a busy one is up to a full frame of
+        // added latency.
+        let drain_thread = {
+            let mut sender = sender.take().expect("sender is returned by every drain");
+            let encoder = Arc::clone(&encoder);
+            let running = Arc::clone(&running);
+            let in_flight = Arc::clone(&in_flight);
+            std::thread::spawn(move || -> (Sender, Result<()>) {
+                while running.load(Ordering::Relaxed) {
+                    match encoder.pull_packet(Duration::from_millis(100)) {
+                        Ok(Some(p)) => {
+                            in_flight.lock().unwrap().push(p.pts_ns, Instant::now());
+                            if let Err(e) = sender.send_frame(&p.data, p.pts_ns, p.keyframe) {
+                                running.store(false, Ordering::Relaxed);
+                                return (sender, Err(e.into()));
+                            }
+                        }
+                        Ok(None) => continue,
+                        Err(e) => {
+                            tracing::error!("encoder: {e}");
+                            running.store(false, Ordering::Relaxed);
+                            return (sender, Err(e));
+                        }
                     }
-                    // Nothing has been acknowledged for a while; forget the
-                    // stale entries so a recovering device is not gated on
-                    // frames that will never be acked.
-                    in_flight.clear();
                 }
-            }
-            let dmabuf = capture
-                .dmabuf(timing.buffer_index)
-                .context("capture produced no DMA-BUF")?;
-            encoder.push_frame(dmabuf, slot * frame_duration_ns)?;
-        }
-        Ok(())
-    })();
+                (sender, Ok(()))
+            })
+        };
 
-    running.store(false, Ordering::Relaxed);
-    let (sender, send_result) = drain_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("send thread panicked"))?;
+        let exit = (|| -> Result<Exit> {
+            while !shutdown.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
+                if let Some(target) = wanted_size(size) {
+                    return Ok(Exit::Resize(target));
+                }
+                let timing = capture.capture_frame()?;
+                let slot = index;
+                index += 1;
+
+                // Shed load before encoding: a dropped source frame costs
+                // nothing, while one already queued toward a slow decoder is
+                // latency.
+                {
+                    let mut in_flight = in_flight.lock().unwrap();
+                    if in_flight.len() >= config.max_in_flight {
+                        if last_ack.lock().unwrap().elapsed() < ACK_STALL {
+                            dropped += 1;
+                            continue;
+                        }
+                        // Nothing has been acknowledged for a while; forget the
+                        // stale entries so a recovering device is not gated on
+                        // frames that will never be acked.
+                        in_flight.clear();
+                    }
+                }
+                let dmabuf = capture
+                    .dmabuf(timing.buffer_index)
+                    .context("capture produced no DMA-BUF")?;
+                encoder.push_frame(dmabuf, slot * frame_duration_ns)?;
+            }
+            Ok(Exit::Stopped)
+        })();
+
+        running.store(false, Ordering::Relaxed);
+        let (returned, send_result) = match drain_thread.join() {
+            Ok(done) => done,
+            Err(_) => {
+                final_result = Err(anyhow::anyhow!("send thread panicked"));
+                break;
+            }
+        };
+        sender = Some(returned);
+
+        let target = match exit {
+            Ok(Exit::Resize(target)) if send_result.is_ok() => target,
+            other => {
+                final_result = other.map(|_| ()).and(send_result);
+                break;
+            }
+        };
+
+        // The device was rotated. Tear the pipeline down before touching the
+        // output so the capture session never sees the mode change, then
+        // bring it back at the new size and tell the device.
+        tracing::info!(
+            "device display reported; resizing stream {}x{} -> {}x{}",
+            size.0,
+            size.1,
+            target.0,
+            target.1
+        );
+        drop(capture);
+        drop(encoder);
+        let rebuilt = (|| -> Result<(Capture, Arc<Encoder>)> {
+            if !output.resize(target.0, target.1)? {
+                bail!("this compositor does not resize the output");
+            }
+            build_pipeline()
+        })();
+        match rebuilt {
+            Ok((new_capture, new_encoder)) => {
+                capture = new_capture;
+                encoder = new_encoder;
+            }
+            Err(e) => {
+                // `capture` and `encoder` were moved, so the shared tail below
+                // cannot be reached; clean up here instead.
+                alive.store(false, Ordering::Relaxed);
+                let _ = ack_thread.join();
+                let _ = adb::shell(serial, &format!("am force-stop {APP_PACKAGE}"));
+                drop(forward);
+                drop(output);
+                return Err(e.context("rebuilding the pipeline after a rotation"));
+            }
+        }
+        size = (capture.width, capture.height);
+        in_flight.lock().unwrap().clear();
+        if let Err(e) = stream_header(capture.width, capture.height, config.fps)
+            .and_then(|h| sender.as_mut().unwrap().send_header(&h))
+        {
+            final_result = Err(e);
+            break;
+        }
+    }
+
+    alive.store(false, Ordering::Relaxed);
     let _ = ack_thread.join();
 
     if config.stats {
@@ -463,7 +575,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
             index,
             dropped,
             config.max_in_flight,
-            sender.bytes_sent(),
+            sender.as_ref().map_or(0, Sender::bytes_sent),
         );
     }
 
@@ -473,7 +585,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
 
     drop(forward);
     drop(output);
-    result.and(send_result)
+    final_result
 }
 
 fn report(trips: &[Duration], frames: u64, dropped: u64, max_in_flight: usize, bytes: u64) {

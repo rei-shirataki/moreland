@@ -50,9 +50,10 @@ class VideoStream(private val socketName: String) {
     private var ackThread: Thread? = null
 
     private val freeInputs = LinkedBlockingQueue<Int>()
-
-    /** Encoded device → host messages (acks and touches), drained by one writer thread. */
+    /** Encoded device-to-host messages, written by one thread so they never interleave. */
     private val outgoing = LinkedBlockingQueue<ByteArray>()
+    /** Latest display size, resent at the start of every connection. */
+    @Volatile private var displaySize: Pair<Int, Int>? = null
 
     /** Contacts the host believes are down, so they can be lifted if the view goes away. */
     private val activeTouches = BooleanArray(Protocol.MAX_TOUCH_SLOTS)
@@ -119,6 +120,16 @@ class VideoStream(private val socketName: String) {
                 }
             }
         }
+    }
+
+    /**
+     * Tell the host the display is now this size, so it can resize the virtual
+     * output to match. Safe to call at any time; the latest size is also sent
+     * when a host connects.
+     */
+    fun reportDisplaySize(width: Int, height: Int) {
+        displaySize = width to height
+        if (client != null) outgoing.offer(Protocol.encodeOrientation(width, height))
     }
 
     fun start() {
@@ -208,15 +219,31 @@ class VideoStream(private val socketName: String) {
         // A new connection means a new injector on the host, with nothing down.
         synchronized(activeTouches) { activeTouches.fill(false) }
 
-        val codec = configureCodec(header, target)
+        var codec = configureCodec(header, target)
         this.codec = codec
+        displaySize?.let { (w, h) -> outgoing.offer(Protocol.encodeOrientation(w, h)) }
         startAckWriter(output)
         connected = true
 
         try {
             var scratch = ByteArray(256 * 1024)
             while (running) {
-                val frame = Protocol.readFrameHeader(input)
+                val frame = when (val next = Protocol.readMessage(input)) {
+                    is Protocol.Message.Frame -> next.header
+                    is Protocol.Message.Header -> {
+                        // The host resized the picture; the next frame it
+                        // sends is a keyframe from a new encoder.
+                        val h = next.header
+                        Log.i(TAG, "stream ${h.width}x${h.height}@${h.framerate} ${h.mime}")
+                        this.codec = null
+                        runCatching { codec.stop() }
+                        runCatching { codec.release() }
+                        freeInputs.clear()
+                        codec = configureCodec(h, awaitSurface())
+                        this.codec = codec
+                        continue
+                    }
+                }
                 if (frame.length > scratch.size) {
                     scratch = ByteArray(frame.length)
                 }

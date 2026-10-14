@@ -36,7 +36,7 @@ object Protocol {
     fun isTrustedPeer(uid: Int): Boolean = uid == SHELL_UID || uid == ROOT_UID
 
     private const val MAGIC = 0x4D524C44 // "MRLD"
-    const val VERSION = 2
+    const val VERSION = 3
 
     const val STREAM_HEADER_LEN = 16
     const val FRAME_HEADER_LEN = 16
@@ -60,12 +60,37 @@ object Protocol {
         val keyframe: Boolean,
     )
 
+    /** What the host sent next: a new picture size, or one access unit. */
+    sealed class Message {
+        data class Header(val header: StreamHeader) : Message()
+        data class Frame(val header: FrameHeader) : Message()
+    }
+
+    /**
+     * Read the next header. A stream header can arrive between frames when the
+     * picture size changes; its magic, read as a length, exceeds
+     * [MAX_FRAME_BYTES], so the first four bytes tell the two apart.
+     */
+    @Throws(IOException::class)
+    fun readMessage(input: DataInputStream): Message {
+        val first = input.readInt()
+        return if (first == MAGIC) {
+            Message.Header(readStreamHeaderBody(input))
+        } else {
+            Message.Frame(readFrameHeaderBody(input, first))
+        }
+    }
+
     @Throws(IOException::class)
     fun readStreamHeader(input: DataInputStream): StreamHeader {
         val magic = input.readInt()
         if (magic != MAGIC) {
             throw IOException("bad magic 0x%08x".format(magic))
         }
+        return readStreamHeaderBody(input)
+    }
+
+    private fun readStreamHeaderBody(input: DataInputStream): StreamHeader {
         val version = input.readUnsignedShort()
         if (version != VERSION) {
             throw IOException("unsupported protocol version $version (expected $VERSION)")
@@ -84,9 +109,7 @@ object Protocol {
         return StreamHeader(width, height, framerate, mime)
     }
 
-    @Throws(IOException::class)
-    fun readFrameHeader(input: DataInputStream): FrameHeader {
-        val length = input.readInt()
+    private fun readFrameHeaderBody(input: DataInputStream, length: Int): FrameHeader {
         if (length < 0 || length > MAX_FRAME_BYTES) {
             throw IOException("implausible frame length $length")
         }
@@ -109,6 +132,7 @@ object Protocol {
     /** Tag byte introducing each device → host message. */
     const val TAG_ACK = 0x01
     const val TAG_TOUCH = 0x02
+    const val TAG_ORIENTATION = 0x03
 
     /** Touch coordinates run 0..TOUCH_EXTENT across the streamed image. */
     const val TOUCH_EXTENT = 65535
@@ -141,5 +165,14 @@ object Protocol {
         (ptsNs ushr 16).toByte(),
         (ptsNs ushr 8).toByte(),
         ptsNs.toByte(),
+    )
+
+    /** Tell the host the display is now `width` x `height` (it was rotated). */
+    fun encodeOrientation(width: Int, height: Int): ByteArray = byteArrayOf(
+        TAG_ORIENTATION.toByte(),
+        (width ushr 8).toByte(),
+        width.toByte(),
+        (height ushr 8).toByte(),
+        height.toByte(),
     )
 }
