@@ -202,8 +202,10 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
             Event::DmabufFormat { format, modifiers } => {
                 state.begin_generation();
                 let modifiers = modifiers
-                    .chunks_exact(8)
-                    .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| u64::from_ne_bytes(*c))
                     .collect();
                 state.caps.dmabuf_formats.push((format, modifiers));
             }
