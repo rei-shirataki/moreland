@@ -20,6 +20,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracker::DeviceTracker;
 
+/// Exit statuses that restarting cannot fix. The systemd unit lists both in
+/// `RestartPreventExitStatus=`, so it gives up instead of relaunching every
+/// `RestartSec` for as long as the session lasts.
+const EXIT_USAGE: i32 = 2;
+const EXIT_UNSUPPORTED: i32 = 3;
+
 #[derive(Debug)]
 struct Args {
     config: session::Config,
@@ -167,7 +173,7 @@ fn main() -> Result<()> {
         }
         Err(e) => {
             eprintln!("moreland: {e}\nTry `moreland --help`.");
-            std::process::exit(2);
+            std::process::exit(EXIT_USAGE);
         }
     };
 
@@ -177,7 +183,10 @@ fn main() -> Result<()> {
     // transient, and the retry backoff would otherwise spin on it for as long
     // as the session lasts.
     let compositor = output::Compositor::detect();
-    compositor.ensure_supported()?;
+    if let Err(e) = compositor.ensure_supported() {
+        tracing::error!("{e:#}");
+        std::process::exit(EXIT_UNSUPPORTED);
+    }
     tracing::info!("compositor: {}", compositor.name());
 
     let shutdown = Arc::new(AtomicBool::new(false));
