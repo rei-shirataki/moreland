@@ -30,16 +30,23 @@ fi
 # live IPC round-trip. A stale HYPRLAND_INSTANCE_SIGNATURE inherited by a
 # long-lived systemd user service otherwise names a compositor that exited
 # hours ago.
+# XDG_CURRENT_DESKTOP is a colon-separated list (labwc sets `labwc:wlroots`),
+# so test membership, case-insensitively as the daemon does.
+desktop_is() {
+    local list=":${XDG_CURRENT_DESKTOP:-}:"
+    [[ "${list,,}" == *":${1,,}:"* ]]
+}
+
 COMPOSITOR="unsupported"
 if { [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] \
-     || [ "${XDG_CURRENT_DESKTOP:-}" = "Hyprland" ]; } \
+     || desktop_is Hyprland; } \
    && hyprctl version >/dev/null 2>&1; then
     COMPOSITOR="Hyprland"
-elif { [ -n "${SWAYSOCK:-}" ] || [ "${XDG_CURRENT_DESKTOP:-}" = "sway" ]; } \
+elif { [ -n "${SWAYSOCK:-}" ] || desktop_is sway; } \
      && swaymsg -t get_version >/dev/null 2>&1; then
     COMPOSITOR="Sway"
-elif { [ "${XDG_CURRENT_DESKTOP:-}" = "labwc" ] \
-       || [ "${XDG_CURRENT_DESKTOP:-}" = "wlroots" ]; } \
+elif { desktop_is labwc \
+       || desktop_is wlroots; } \
      && wlr-randr >/dev/null 2>&1; then
     COMPOSITOR="labwc"
 fi
@@ -95,7 +102,7 @@ else
     # KWin exposes capture only through its own privileged protocol, so it
     # never appears in a plain registry listing. Say so rather than leaving
     # the absence above looking like a packaging fault.
-    if [ "${XDG_CURRENT_DESKTOP:-}" = "KDE" ]; then
+    if desktop_is KDE; then
         info ""
         info "KWin implements neither the ext- nor the wlr- capture protocols,"
         info "and KDE has declined to (bug 513785). It exposes capture through"
@@ -109,7 +116,7 @@ fi
 # Not yet wired to anything: the Plasma capture backend is unimplemented. This
 # reports whether the privileged-interface grant is in place, because it fails
 # silently — KWin denies the protocol with no diagnostic anywhere.
-if [ "${XDG_CURRENT_DESKTOP:-}" = "KDE" ]; then
+if desktop_is KDE; then
     head_ "KDE backend prerequisites (groundwork; backend not yet implemented)"
 
     ENTRY="$HOME/.local/share/applications/moreland.desktop"

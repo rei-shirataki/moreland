@@ -45,12 +45,12 @@ impl Compositor {
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
 
         if (std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
-            || desktop.eq_ignore_ascii_case("Hyprland"))
+            || desktop_names(&desktop, "Hyprland"))
             && run("hyprctl", &["version"]).is_ok()
         {
             return Compositor::Hyprland;
         }
-        if (std::env::var_os("SWAYSOCK").is_some() || desktop.eq_ignore_ascii_case("sway"))
+        if (std::env::var_os("SWAYSOCK").is_some() || desktop_names(&desktop, "sway"))
             && run("swaymsg", &["-t", "get_version"]).is_ok()
         {
             return Compositor::Sway;
@@ -60,7 +60,7 @@ impl Compositor {
         // confirming round-trip is `wlr-randr`, which is also how this backend
         // reads output state later: if it cannot list outputs now, the backend
         // could not work anyway.
-        if (desktop.eq_ignore_ascii_case("labwc") || desktop.eq_ignore_ascii_case("wlroots"))
+        if (desktop_names(&desktop, "labwc") || desktop_names(&desktop, "wlroots"))
             && run("wlr-randr", &[]).is_ok()
         {
             return Compositor::Labwc;
@@ -104,6 +104,17 @@ impl Compositor {
             }
         }
     }
+}
+
+/// Whether `XDG_CURRENT_DESKTOP` names `wanted`.
+///
+/// The variable is a colon-separated list, most specific first — labwc sets
+/// `labwc:wlroots` — so comparing the whole value misses every compositor
+/// that lists more than one name.
+fn desktop_names(desktop: &str, wanted: &str) -> bool {
+    desktop
+        .split(':')
+        .any(|name| name.trim().eq_ignore_ascii_case(wanted))
 }
 
 fn run(program: &str, args: &[&str]) -> Result<String> {
@@ -553,6 +564,16 @@ mod tests {
         for parser in [HyprParser::Legacy, HyprParser::Lua] {
             assert!(hyprland_restore_commands(&states, "moreland", parser).is_empty());
         }
+    }
+
+    #[test]
+    fn desktop_matches_any_entry_of_the_list() {
+        assert!(desktop_names("labwc:wlroots", "labwc"));
+        assert!(desktop_names("labwc:wlroots", "wlroots"));
+        assert!(desktop_names("Hyprland", "hyprland"));
+        assert!(!desktop_names("KDE", "labwc"));
+        assert!(!desktop_names("", "sway"));
+        assert!(!desktop_names("swayfx", "sway"));
     }
 
     #[test]
