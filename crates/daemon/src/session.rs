@@ -155,7 +155,7 @@ pub fn app_installed(serial: &str) -> Result<bool> {
 /// Every resource here is RAII-scoped: the virtual output and the adb forward
 /// are removed when this function returns, however it returns.
 pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
-    let config = &config.tuned_for(serial);
+    let config = config.tuned_for(serial);
     if !app_installed(serial)? {
         bail!(
             "app not installed on the tablet.\n\
@@ -235,7 +235,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
             protocol::SOCKET_EXTRA
         ),
     )
-        .context("launching the display app")?;
+    .context("launching the display app")?;
     std::thread::sleep(Duration::from_millis(2500));
 
     // Probe what this machine's encoder can actually import rather than
@@ -348,6 +348,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         let round_trips = Arc::clone(&round_trips);
         let alive = Arc::clone(&alive);
         let reported = Arc::clone(&reported);
+        let record_stats = config.stats;
         std::thread::spawn(move || {
             // Messages are small and fixed-length per tag; one can arrive
             // split across reads, so keep what has not parsed yet.
@@ -370,11 +371,24 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                                             if let Some(rtt) =
                                                 in_flight.lock().unwrap().ack(pts_ns, now)
                                             {
-                                                round_trips.lock().unwrap().push(rtt);
+                                                if record_stats {
+                                                    let mut trips = round_trips.lock().unwrap();
+                                                    if trips.len() < 100_000 {
+                                                        trips.push(rtt);
+                                                    }
+                                                }
                                             }
                                         }
                                         protocol::DeviceMessage::Orientation { width, height } => {
-                                            *reported.lock().unwrap() = Some((width, height));
+                                            if (100..=10_000).contains(&width)
+                                                && (100..=10_000).contains(&height)
+                                            {
+                                                *reported.lock().unwrap() = Some((width, height));
+                                            } else {
+                                                tracing::warn!(
+                                                    "ignoring invalid orientation dimensions: {width}x{height}"
+                                                );
+                                            }
                                         }
                                         protocol::DeviceMessage::Touch(event) => {
                                             if let Some(injector) = touch_in.as_mut() {
@@ -407,22 +421,38 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         })
     };
 
-    // The size the picture should have for the device's reported display, or
-    // `None` when it is already that size.
-    let wanted_size = |size: (u32, u32)| -> Option<(u32, u32)> {
-        let (w, h) = (*reported.lock().unwrap())?;
-        if w == 0 || h == 0 {
-            return None;
-        }
-        let portrait = h > w;
-        let target = match config.resolution {
-            Some((ew, eh)) => {
-                let (long, short) = (ew.max(eh), ew.min(eh));
-                if portrait { (short, long) } else { (long, short) }
+    struct SessionGuard<'a> {
+        serial: &'a str,
+        alive: Arc<AtomicBool>,
+        ack_thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl<'a> Drop for SessionGuard<'a> {
+        fn drop(&mut self) {
+            self.alive.store(false, Ordering::Relaxed);
+            if let Some(handle) = self.ack_thread.take() {
+                let _ = handle.join();
             }
-            None => adb::stream_resolution((u32::from(w), u32::from(h)), config.max_width),
-        };
-        (target != size).then_some(target)
+            let _ = adb::shell(self.serial, &format!("am force-stop {APP_PACKAGE}"));
+        }
+    }
+
+    let _session_guard = SessionGuard {
+        serial,
+        alive: Arc::clone(&alive),
+        ack_thread: Some(ack_thread),
+    };
+
+    // The size the picture should have for the device's reported display, or
+    // `None` when it is already that size, or when the compositor cannot resize.
+    let wanted_size = |size: (u32, u32)| -> Option<(u32, u32)> {
+        compute_wanted_size(
+            output.can_resize(),
+            *reported.lock().unwrap(),
+            config.resolution,
+            config.max_width,
+            size,
+        )
     };
 
     enum Exit {
@@ -456,7 +486,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                             in_flight.lock().unwrap().push(p.pts_ns, Instant::now());
                             if let Err(e) = sender.send_frame(&p.data, p.pts_ns, p.keyframe) {
                                 running.store(false, Ordering::Relaxed);
-                                return (sender, Err(e.into()));
+                                return (sender, Err(e));
                             }
                         }
                         Ok(None) => continue,
@@ -536,7 +566,9 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         drop(encoder);
         let rebuilt = (|| -> Result<(Capture, Arc<Encoder>)> {
             if !output.resize(target.0, target.1)? {
-                bail!("this compositor does not resize the output");
+                tracing::warn!(
+                    "compositor declined output resize; rebuilding pipeline with current size"
+                );
             }
             build_pipeline()
         })();
@@ -546,13 +578,6 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                 encoder = new_encoder;
             }
             Err(e) => {
-                // `capture` and `encoder` were moved, so the shared tail below
-                // cannot be reached; clean up here instead.
-                alive.store(false, Ordering::Relaxed);
-                let _ = ack_thread.join();
-                let _ = adb::shell(serial, &format!("am force-stop {APP_PACKAGE}"));
-                drop(forward);
-                drop(output);
                 return Err(e.context("rebuilding the pipeline after a rotation"));
             }
         }
@@ -566,8 +591,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         }
     }
 
-    alive.store(false, Ordering::Relaxed);
-    let _ = ack_thread.join();
+    drop(_session_guard);
 
     if config.stats {
         report(
@@ -578,10 +602,6 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
             sender.as_ref().map_or(0, Sender::bytes_sent),
         );
     }
-
-    // Leaving the app in the foreground with a dead socket is confusing; send
-    // it home so the tablet returns to a normal state.
-    let _ = adb::shell(serial, &format!("am force-stop {APP_PACKAGE}"));
 
     drop(forward);
     drop(output);
@@ -603,8 +623,40 @@ fn report(trips: &[Duration], frames: u64, dropped: u64, max_in_flight: usize, b
     println!("\n  round trip: host send -> device render -> host ack");
     println!("    min       {:>8.2} ms", ms(trips[0]));
     println!("    median    {:>8.2} ms", ms(trips[trips.len() / 2]));
-    println!("    p95       {:>8.2} ms", ms(trips[trips.len() * 95 / 100]));
+    println!(
+        "    p95       {:>8.2} ms",
+        ms(trips[trips.len() * 95 / 100])
+    );
     println!("    max       {:>8.2} ms", ms(trips[trips.len() - 1]));
+}
+
+fn compute_wanted_size(
+    can_resize: bool,
+    reported: Option<(u16, u16)>,
+    config_resolution: Option<(u32, u32)>,
+    max_width: u32,
+    current_size: (u32, u32),
+) -> Option<(u32, u32)> {
+    if !can_resize {
+        return None;
+    }
+    let (w, h) = reported?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let portrait = h > w;
+    let target = match config_resolution {
+        Some((ew, eh)) => {
+            let (long, short) = (ew.max(eh), ew.min(eh));
+            if portrait {
+                (short, long)
+            } else {
+                (long, short)
+            }
+        }
+        None => adb::stream_resolution((u32::from(w), u32::from(h)), max_width),
+    };
+    (target != current_size).then_some(target)
 }
 
 #[cfg(test)]
@@ -619,6 +671,27 @@ mod tests {
         assert_eq!(a.len(), "moreland-".len() + 32);
         // Must also satisfy the app's own pattern, [A-Za-z0-9._-]{1,64}.
         assert!(a.len() <= 64);
-        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)));
+    }
+
+    #[test]
+    fn wanted_size_ignored_when_output_cannot_resize() {
+        // labwc or borrowed output
+        let res = compute_wanted_size(false, Some((1200, 1920)), None, 1920, (1920, 1200));
+        assert_eq!(res, None);
+    }
+
+    #[test]
+    fn wanted_size_detects_rotation_to_portrait() {
+        let res = compute_wanted_size(true, Some((1200, 1920)), None, 1920, (1920, 1200));
+        assert_eq!(res, Some((1200, 1920)));
+    }
+
+    #[test]
+    fn wanted_size_noop_when_dimensions_match() {
+        let res = compute_wanted_size(true, Some((1920, 1200)), None, 1920, (1920, 1200));
+        assert_eq!(res, None);
     }
 }

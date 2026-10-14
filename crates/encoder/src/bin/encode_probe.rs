@@ -177,16 +177,28 @@ fn main() -> Result<()> {
     }
 
     println!("\n  throughput");
-    println!("    rate      {:>8.2} fps", frames as f64 / wall.as_secs_f64());
+    println!(
+        "    rate      {:>8.2} fps",
+        frames as f64 / wall.as_secs_f64()
+    );
     println!("    packets   {} ({keyframes} keyframes)", sizes.len());
 
     if !latencies.is_empty() {
         latencies.sort_unstable();
         println!("\n  encode latency (push -> packet, pipelined)");
         println!("    min       {:>8.2} ms", ms(latencies[0]));
-        println!("    median    {:>8.2} ms", ms(latencies[latencies.len() / 2]));
-        println!("    p95       {:>8.2} ms", ms(latencies[latencies.len() * 95 / 100]));
-        println!("    max       {:>8.2} ms", ms(latencies[latencies.len() - 1]));
+        println!(
+            "    median    {:>8.2} ms",
+            ms(latencies[latencies.len() / 2])
+        );
+        println!(
+            "    p95       {:>8.2} ms",
+            ms(latencies[latencies.len() * 95 / 100])
+        );
+        println!(
+            "    max       {:>8.2} ms",
+            ms(latencies[latencies.len() - 1])
+        );
     }
 
     let total: usize = sizes.iter().sum();

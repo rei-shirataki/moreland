@@ -370,7 +370,10 @@ impl Capture {
             .map(|o| o.proxy.clone())
             .with_context(|| {
                 let known: Vec<&str> = state.outputs.iter().map(|o| o.name.as_str()).collect();
-                format!("no output named {output_name:?} (have: {})", known.join(", "))
+                format!(
+                    "no output named {output_name:?} (have: {})",
+                    known.join(", ")
+                )
             })?;
 
         let source_manager: ExtOutputImageCaptureSourceManagerV1 = globals
@@ -624,7 +627,9 @@ impl Capture {
             return Err(CaptureError::Stopped);
         }
         if self.buffers.is_empty() {
-            return Err(CaptureError::Other(anyhow::anyhow!("capture pool is empty")));
+            return Err(CaptureError::Other(anyhow::anyhow!(
+                "capture pool is empty"
+            )));
         }
 
         let index = self.next_buffer;
@@ -645,9 +650,13 @@ impl Capture {
             && self.state.frame_failed.is_none()
             && self.state.frame_failed_raw.is_none()
         {
-            self.queue
-                .blocking_dispatch(&mut self.state)
-                .map_err(|e| CaptureError::Other(e.into()))?;
+            if self.state.session_stopped {
+                frame.destroy();
+                return Err(CaptureError::Stopped);
+            }
+            let step_deadline = Instant::now() + Duration::from_millis(200);
+            dispatch_until(&mut self.queue, &mut self.state, step_deadline)
+                .map_err(CaptureError::Other)?;
         }
         let latency = started.elapsed();
         let received_ns = monotonic_ns();

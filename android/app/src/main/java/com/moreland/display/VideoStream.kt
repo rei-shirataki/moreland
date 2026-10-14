@@ -44,10 +44,10 @@ class VideoStream(private val socketName: String) {
     @Volatile private var surface: Surface? = null
     /** The live decoder, so its output surface can be swapped in place. */
     @Volatile private var codec: MediaCodec? = null
-    private var serverSocket: LocalServerSocket? = null
-    private var client: LocalSocket? = null
-    private var thread: Thread? = null
-    private var ackThread: Thread? = null
+    @Volatile private var serverSocket: LocalServerSocket? = null
+    @Volatile private var client: LocalSocket? = null
+    @Volatile private var thread: Thread? = null
+    @Volatile private var ackThread: Thread? = null
 
     private val freeInputs = LinkedBlockingQueue<Int>()
     /** Encoded device-to-host messages, written by one thread so they never interleave. */
@@ -282,7 +282,7 @@ class VideoStream(private val socketName: String) {
 
     private fun configureCodec(header: Protocol.StreamHeader, target: Surface): MediaCodec {
         var failure: Exception? = null
-        for (hints in Hints.values()) {
+        for (hints in Hints.entries) {
             try {
                 return configureCodec(header, target, hints)
             } catch (e: Exception) {
@@ -344,6 +344,9 @@ class VideoStream(private val socketName: String) {
                 override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
                     lastError = e.message
                     Log.e(TAG, "codec error: ${e.message}", e)
+                    // Abort the session so the host learns of the failure and the
+                    // app returns to listening for a clean reconnection.
+                    runCatching { client?.close() }
                 }
 
                 override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {

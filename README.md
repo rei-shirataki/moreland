@@ -346,19 +346,15 @@ app does its own checks: it accepts connections only from adbd (the `shell` or
 `root` user), and the daemon gives it a fresh random socket name each session,
 so no other app can claim the name first and receive the desktop stream.
 
-The remaining exposure is not exploitable for anything beyond drawing on the
-tablet's screen, and does not reach back into the host. But this is a single-user desktop tool and
-is not hardened for a hostile local user.
+**Touch forwarding reaches the host.** Tablet touches are relayed via `/dev/uinput`
+to control the desktop. Combined with `showWhenLocked` and `wm dismiss-keyguard`,
+anyone with physical access to a connected tablet can interact with the host session.
+Use `--no-touch` if you do not want input forwarding or when leaving the tablet
+unattended. On multi-monitor setups, ensure compositor output mappings match your
+display topology.
 
-**The app requests no Android permissions at all** - not even `INTERNET`. It can
-draw to its own surface and nothing else.
-
-**Wire data is bounds-checked** on both sides: magic and version on the stream
-header, and a frame-length cap on the device so a malformed length cannot drive
-a huge allocation.
-
-**Two `unsafe` blocks**, both mapping buffers the kernel just gave us, both
-commented with their invariants.
+**Four `unsafe` blocks**, covering kernel buffer mappings (`shm`, `encoder`) and
+`/dev/uinput` ioctl structures (`touch`), each commented with its safety invariants.
 
 **Enabling USB debugging is the real security decision here**, and it is not
 specific to this project. An authorised ADB host has broad access to the device.

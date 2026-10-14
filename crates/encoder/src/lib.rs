@@ -5,7 +5,7 @@
 //! ```text
 //! appsrc  video/x-raw(memory:DMABuf) DMA_DRM XR24:<modifier>
 //!   -> vapostproc     XR24 -> NV12, on the GPU
-//!   -> vah264enc      CBR, no B-frames, sparse keyframes
+//!   -> vah264enc      VBR (default), no B-frames, sparse keyframes
 //!   -> h264parse      Annex-B, SPS/PPS ahead of every IDR
 //!   -> appsink
 //! ```
@@ -15,6 +15,7 @@
 
 use anyhow::{bail, Context, Result};
 use capture::dmabuf::Dmabuf;
+use capture::session::fourcc_name;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_allocators::prelude::*;
@@ -59,7 +60,7 @@ pub fn supported_modifiers(fourcc: u32) -> Option<Vec<u64>> {
                     let Ok(value) = structure.value("drm-format") else {
                         continue;
                     };
-                    collect_modifiers(&value, &wanted, &mut modifiers);
+                    collect_modifiers(value, &wanted, &mut modifiers);
                 }
             }
         }
@@ -157,7 +158,7 @@ fn supported_modifiers_strict(wanted: &str) -> Vec<u64> {
                     continue;
                 }
                 if let Ok(value) = structure.value("drm-format") {
-                    collect_modifiers(&value, wanted, &mut modifiers);
+                    collect_modifiers(value, wanted, &mut modifiers);
                 }
             }
         }
@@ -251,11 +252,7 @@ impl Encoder {
     pub fn new(config: &EncoderConfig) -> Result<Self> {
         gst::init().context("initialising GStreamer")?;
 
-        let drm_format = format!(
-            "{}:0x{:016x}",
-            fourcc_name(config.fourcc),
-            config.modifier
-        );
+        let drm_format = format!("{}:0x{:016x}", fourcc_name(config.fourcc), config.modifier);
 
         // DMA_DRM caps carry the tiling; the encoder chain stays on the GPU
         // from here to the bitstream — when the driver can import the format.
@@ -267,10 +264,7 @@ impl Encoder {
                 .field("drm-format", &drm_format)
                 .field("width", config.width as i32)
                 .field("height", config.height as i32)
-                .field(
-                    "framerate",
-                    gst::Fraction::new(config.framerate as i32, 1),
-                )
+                .field("framerate", gst::Fraction::new(config.framerate as i32, 1))
                 .build();
             (caps, VideoFormat::DmaDrm)
         } else {
@@ -292,10 +286,7 @@ impl Encoder {
                 .field("format", format)
                 .field("width", config.width as i32)
                 .field("height", config.height as i32)
-                .field(
-                    "framerate",
-                    gst::Fraction::new(config.framerate as i32, 1),
-                )
+                .field("framerate", gst::Fraction::new(config.framerate as i32, 1))
                 .build();
             let video_format = match format {
                 "BGRx" => VideoFormat::Bgrx,
@@ -550,10 +541,6 @@ fn inspect_dmabuf(
         size => size,
     };
     Ok((OwnedFd::from(file), (meta.dev(), meta.ino()), size))
-}
-
-fn fourcc_name(code: u32) -> String {
-    String::from_utf8_lossy(&code.to_le_bytes()).into_owned()
 }
 
 #[cfg(test)]

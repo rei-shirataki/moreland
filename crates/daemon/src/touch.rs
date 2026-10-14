@@ -217,13 +217,10 @@ pub struct TouchInjector {
 
 impl TouchInjector {
     pub fn create() -> Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .open("/dev/uinput")
-            .context(
-                "opening /dev/uinput — the user needs write access to it, \
+        let file = OpenOptions::new().write(true).open("/dev/uinput").context(
+            "opening /dev/uinput — the user needs write access to it, \
                  see the Touch section of the README",
-            )?;
+        )?;
 
         let set = |request: u64, value: i32| {
             ioctl(&file, request, value).with_context(|| format!("uinput ioctl {request:#x}"))
@@ -426,5 +423,14 @@ mod tests {
             .all(|f| has(f, EV_ABS, ABS_MT_TRACKING_ID, -1)));
         assert_eq!(c.count(), 0);
         assert!(c.release_all().is_empty());
+    }
+
+    #[test]
+    fn uinput_struct_sizes_match_kernel_layout() {
+        assert_eq!(std::mem::size_of::<InputId>(), 8);
+        assert_eq!(std::mem::size_of::<UinputSetup>(), 92);
+        assert_eq!(std::mem::size_of::<InputAbsinfo>(), 24);
+        assert_eq!(std::mem::size_of::<UinputAbsSetup>(), 28);
+        assert_eq!(std::mem::size_of::<InputEvent>(), 24);
     }
 }

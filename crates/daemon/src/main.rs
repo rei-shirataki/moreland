@@ -235,7 +235,7 @@ fn main() -> Result<()> {
             Err(e) => {
                 tracing::warn!("device tracker lost: {e}; reconnecting");
                 devices.clear();
-                std::thread::sleep(Duration::from_secs(2));
+                sleep_with_shutdown(Duration::from_secs(2), &shutdown);
                 match DeviceTracker::connect() {
                     Ok(t) => {
                         tracker = t;
@@ -290,11 +290,22 @@ fn main() -> Result<()> {
         if consecutive_failures > 2 {
             tracing::info!("retrying in {}s", backoff.as_secs());
         }
-        std::thread::sleep(backoff);
+        sleep_with_shutdown(backoff, &shutdown);
     }
 
     tracing::info!("shutting down");
     Ok(())
+}
+
+fn sleep_with_shutdown(duration: Duration, shutdown: &AtomicBool) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < duration {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let remaining = duration.saturating_sub(start.elapsed());
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
 }
 
 #[cfg(test)]
@@ -357,5 +368,19 @@ mod tests {
     #[test]
     fn help_is_recognised() {
         assert!(matches!(parse(&["-h"]), Ok(Command::Help)));
+    }
+
+    #[test]
+    fn sleep_with_shutdown_terminates_early_when_signaled() {
+        let shutdown = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                shutdown.store(true, Ordering::Relaxed);
+            });
+            sleep_with_shutdown(Duration::from_secs(5), &shutdown);
+        });
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }
