@@ -182,17 +182,36 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     std::thread::sleep(Duration::from_millis(2500));
 
     // Probe what this machine's encoder can actually import rather than
-    // assuming; the accepted modifier set is GPU-vendor specific.
-    let allowed_modifiers = encoder::supported_modifiers(capture::XR24);
-    tracing::debug!("encoder accepts modifiers {allowed_modifiers:02x?}");
+    // assuming; both the format and its modifiers are GPU-vendor specific.
+    // XR24 first — the output is opaque, so alpha is wasted work — then AR24,
+    // which is all Intel's iHD driver offers for 8-bit RGB (issue #3).
+    let mut allowed: Vec<(u32, Vec<u64>)> = [capture::XR24, capture::AR24]
+        .into_iter()
+        .filter_map(|f| encoder::supported_modifiers(f).map(|m| (f, m)))
+        .collect();
+    // Formats the encoder cannot import as DMA-BUF stay usable as a last
+    // resort: the encoder wraps a linear buffer as system memory instead
+    // (see `Encoder::new`). Listed after everything zero-copy, so they are
+    // only picked when the compositor offers nothing better.
+    for f in [capture::XR24, capture::AR24] {
+        if !allowed.iter().any(|(a, _)| *a == f) {
+            allowed.push((f, vec![0]));
+        }
+    }
+    tracing::debug!(
+        "consumer accepts {:02x?}",
+        allowed
+            .iter()
+            .map(|(f, m)| (capture::session::fourcc_name(*f), m))
+            .collect::<Vec<_>>()
+    );
 
     let mut capture = Capture::new(
         output.name(),
         &CaptureConfig {
             mode: BufferMode::Dmabuf,
             pool_size: 3,
-            allowed_modifiers,
-            allowed_formats: encoder::supported_dmabuf_formats(),
+            allowed_formats: allowed,
             paint_cursor: config.paint_cursor,
         },
     )?;
