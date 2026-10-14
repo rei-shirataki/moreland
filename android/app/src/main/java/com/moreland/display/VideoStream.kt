@@ -6,6 +6,7 @@ import android.media.MediaCodec
 import android.media.MediaFormat
 import android.net.LocalServerSocket
 import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import android.os.Build
 import android.util.Log
 import android.view.Surface
@@ -83,6 +84,13 @@ class VideoStream(private val socketName: String) {
 
     fun stop() {
         running = false
+        // Closing a LocalServerSocket does not reliably wake a thread parked
+        // in accept(), and a thread left there keeps the socket name bound,
+        // so a later instance in this process could never listen. A throwaway
+        // connection does wake it: it fails the peer check, and the loop then
+        // sees `running` is false. Connect before closing, or there is
+        // nothing left to connect to.
+        runCatching { LocalSocket().use { it.connect(LocalSocketAddress(socketName)) } }
         runCatching { client?.close() }
         runCatching { serverSocket?.close() }
         thread?.interrupt()

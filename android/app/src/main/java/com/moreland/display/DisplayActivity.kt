@@ -24,6 +24,7 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var surfaceView: SurfaceView
     private lateinit var status: TextView
     private var stream: VideoStream? = null
+    private val refreshStatusTask = Runnable { refreshStatus() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -74,7 +75,10 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
         // swapped here — creating a stream per surface races two instances for
         // the single process-wide socket name.
         stream?.setSurface(holder.surface)
-        status.postDelayed(::refreshStatus, 1000)
+        // Surfaces are recreated often (see VideoStream.setSurface); keep a
+        // single refresh loop rather than starting another each time.
+        status.removeCallbacks(refreshStatusTask)
+        status.postDelayed(refreshStatusTask, 1000)
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -86,6 +90,7 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
+        status.removeCallbacks(refreshStatusTask)
         stream?.stop()
         stream = null
         super.onDestroy()
@@ -97,7 +102,7 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
             status.visibility = View.GONE
         } else {
             stream.lastError?.let { status.text = "Waiting for host…\n\nLast error: $it" }
-            status.postDelayed(::refreshStatus, 1000)
+            status.postDelayed(refreshStatusTask, 1000)
         }
     }
 
