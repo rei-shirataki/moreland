@@ -4,7 +4,7 @@
 
 pub mod adb;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use protocol::{Codec, FrameHeader, StreamHeader};
 use std::io::{IoSlice, Write};
 use std::net::TcpStream;
@@ -47,7 +47,16 @@ impl Sender {
     /// Send one access unit. Header and payload go out in a single vectored
     /// write so they cannot be split into separate segments.
     pub fn send_frame(&mut self, payload: &[u8], pts_ns: u64, keyframe: bool) -> Result<()> {
+        if payload.len() > protocol::MAX_FRAME_BYTES {
+            bail!(
+                "encoded frame of {} bytes exceeds the device's {}-byte limit; \
+                 lower --bitrate or the resolution",
+                payload.len(),
+                protocol::MAX_FRAME_BYTES
+            );
+        }
         let header = FrameHeader {
+            // Bounded by MAX_FRAME_BYTES above, so this cannot truncate.
             length: payload.len() as u32,
             pts_ns,
             keyframe,
@@ -101,11 +110,42 @@ fn write_all_vectored(writer: &mut impl Write, slices: &mut [IoSlice<'_>]) -> st
 }
 
 /// Convenience for the common case.
-pub fn stream_header(width: u32, height: u32, framerate: u32) -> StreamHeader {
-    StreamHeader {
-        width: width as u16,
-        height: height as u16,
-        framerate: framerate as u16,
+///
+/// The wire fields are 16-bit. A value that does not fit is an error rather
+/// than silently truncated, which would tell the decoder a different size
+/// than the encoder produces.
+pub fn stream_header(width: u32, height: u32, framerate: u32) -> Result<StreamHeader> {
+    let field = |name: &str, value: u32| {
+        u16::try_from(value).with_context(|| format!("stream {name} {value} exceeds {}", u16::MAX))
+    };
+    Ok(StreamHeader {
+        width: field("width", width)?,
+        height: field("height", height)?,
+        framerate: field("framerate", framerate)?,
         codec: Codec::H264,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_header_rejects_values_the_wire_cannot_carry() {
+        assert!(stream_header(1920, 1200, 90).is_ok());
+        assert!(stream_header(70_000, 1200, 90).is_err());
+        assert!(stream_header(1920, 1200, 70_000).is_err());
+    }
+
+    #[test]
+    fn oversized_frames_are_refused_before_anything_is_written() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut sender = Sender::connect(port, &stream_header(16, 16, 60).unwrap()).unwrap();
+        let before = sender.bytes_sent();
+        let huge = vec![0u8; protocol::MAX_FRAME_BYTES + 1];
+        assert!(sender.send_frame(&huge, 0, true).is_err());
+        assert_eq!(sender.bytes_sent(), before);
+        assert!(sender.send_frame(&[0u8; 16], 0, true).is_ok());
     }
 }

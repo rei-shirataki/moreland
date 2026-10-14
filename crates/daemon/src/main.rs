@@ -20,101 +20,162 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracker::DeviceTracker;
 
+/// Exit statuses that restarting cannot fix. The systemd unit lists both in
+/// `RestartPreventExitStatus=`, so it gives up instead of relaunching every
+/// `RestartSec` for as long as the session lasts.
+const EXIT_USAGE: i32 = 2;
+const EXIT_UNSUPPORTED: i32 = 3;
+
+#[derive(Debug)]
 struct Args {
     config: session::Config,
     once: bool,
     seconds: Option<u64>,
 }
 
-fn parse_args() -> Args {
+/// What the command line asked for.
+#[derive(Debug)]
+enum Command {
+    Run(Args),
+    Help,
+}
+
+/// Parse the command line, rejecting anything not understood.
+///
+/// Silently falling back is worse than refusing here: a typo like
+/// `--bitrate=8000` or `--fps abc` used to run with a default the user never
+/// chose — and `--fps abc` even marked it explicit, overriding device tuning.
+/// Both `--flag value` and `--flag=value` are accepted.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut config = session::Config::default();
     let mut once = false;
     let mut seconds = None;
     let (mut width, mut height) = (None, None);
 
-    let mut it = std::env::args().skip(1);
+    let mut it = args.into_iter();
     while let Some(arg) = it.next() {
-        let mut next_u32 = |default: u32| {
-            it.next().and_then(|v| v.parse().ok()).unwrap_or(default)
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => {
+                (flag.to_string(), Some(value.to_string()))
+            }
+            _ => (arg.clone(), None),
         };
-        match arg.as_str() {
-            "--width" => width = Some(next_u32(1920)),
-            "--height" => height = Some(next_u32(1200)),
-            "--max-width" => config.max_width = next_u32(1920),
+        let mut value = || -> Result<String, String> {
+            inline
+                .clone()
+                .or_else(|| it.next())
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        let takes_value = matches!(
+            flag.as_str(),
+            "--width"
+                | "--height"
+                | "--max-width"
+                | "--fps"
+                | "--bitrate"
+                | "--max-in-flight"
+                | "--target-usage"
+                | "--position"
+                | "--position-y"
+                | "--output-name"
+                | "--seconds"
+        );
+        if !takes_value && inline.is_some() {
+            return Err(format!("{flag} does not take a value"));
+        }
+
+        match flag.as_str() {
+            "--width" => width = Some(number(&flag, &value()?, 1, u32::from(u16::MAX))?),
+            "--height" => height = Some(number(&flag, &value()?, 1, u32::from(u16::MAX))?),
+            "--max-width" => config.max_width = number(&flag, &value()?, 2, u32::MAX)?,
             "--native" => config.max_width = u32::MAX,
             "--fps" => {
-                config.fps = next_u32(60);
+                config.fps = number(&flag, &value()?, 1, 1000)?;
                 config.fps_explicit = true;
             }
             "--bitrate" => {
-                config.bitrate_kbps = next_u32(20_000);
+                config.bitrate_kbps = number(&flag, &value()?, 1, u32::MAX)?;
                 config.bitrate_explicit = true;
             }
             "--max-in-flight" => {
-                config.max_in_flight = next_u32(3).max(1) as usize;
+                config.max_in_flight = number(&flag, &value()?, 1, 64)? as usize;
                 config.max_in_flight_explicit = true;
             }
             "--cavlc" => config.cabac = false,
-            "--target-usage" => config.target_usage = next_u32(3).clamp(1, 7),
-            "--position" => {
-                config.position_x = it
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(config.position_x);
-            }
-            "--position-y" => {
-                config.position_y = it
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(config.position_y);
-            }
+            "--target-usage" => config.target_usage = number(&flag, &value()?, 1, 7)?,
+            "--position" => config.position_x = number(&flag, &value()?, i32::MIN, i32::MAX)?,
+            "--position-y" => config.position_y = number(&flag, &value()?, i32::MIN, i32::MAX)?,
             "--output-name" => {
-                if let Some(name) = it.next() {
-                    config.output_name = name;
+                let name = value()?;
+                // The name is spliced into `hyprctl keyword monitor` rules,
+                // which are comma-separated.
+                if name.is_empty() || name.contains(',') || name.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "--output-name {name:?} must be non-empty, without commas or spaces"
+                    ));
                 }
+                config.output_name = name;
             }
             "--show-cursor" => config.paint_cursor = true,
             "--once" => once = true,
             "--stats" => config.stats = true,
             "--seconds" => {
-                seconds = it.next().and_then(|v| v.parse().ok());
+                seconds = Some(number(&flag, &value()?, 1, u64::MAX)?);
                 once = true;
                 config.stats = true;
             }
-            "--help" | "-h" => {
-                println!("{}", include_str!("usage.txt"));
-                std::process::exit(0);
-            }
-            _ => {}
+            "--help" | "-h" => return Ok(Command::Help),
+            other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    // Only an explicit pair pins the resolution; one alone still auto-detects,
-    // since a half-specified size would silently distort the aspect ratio.
+
+    // A half-specified size would silently distort the aspect ratio.
     config.resolution = match (width, height) {
         (Some(w), Some(h)) => Some((w, h)),
         (Some(_), None) | (None, Some(_)) => {
-            eprintln!("--width and --height must be given together; auto-detecting instead");
-            None
+            return Err("--width and --height must be given together".to_string())
         }
         (None, None) => None,
     };
 
-    Args {
+    Ok(Command::Run(Args {
         config,
         once,
         seconds,
+    }))
+}
+
+fn number<T>(flag: &str, value: &str, min: T, max: T) -> Result<T, String>
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display,
+{
+    let parsed: T = value
+        .parse()
+        .map_err(|_| format!("{flag}: {value:?} is not a number"))?;
+    if parsed < min || parsed > max {
+        return Err(format!("{flag}: {value} is out of range ({min}..={max})"));
     }
+    Ok(parsed)
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let args = parse_args();
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(Command::Run(args)) => args,
+        Ok(Command::Help) => {
+            println!("{}", include_str!("usage.txt"));
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("moreland: {e}\nTry `moreland --help`.");
+            std::process::exit(EXIT_USAGE);
+        }
+    };
 
     // Refuse to start rather than discovering this once per device event. The
     // compositor cannot change under a running daemon — the unit is
@@ -122,7 +183,10 @@ fn main() -> Result<()> {
     // transient, and the retry backoff would otherwise spin on it for as long
     // as the session lasts.
     let compositor = output::Compositor::detect();
-    compositor.ensure_supported()?;
+    if let Err(e) = compositor.ensure_supported() {
+        tracing::error!("{e:#}");
+        std::process::exit(EXIT_UNSUPPORTED);
+    }
     tracing::info!("compositor: {}", compositor.name());
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -159,14 +223,13 @@ fn main() -> Result<()> {
     while !shutdown.load(Ordering::Relaxed) {
         // Short timeout: absence of an update is normal and just means the
         // list still stands.
-        tracker.set_timeout(Some(Duration::from_millis(500)))?;
-        match tracker.next_update() {
-            Ok(update) => {
+        match tracker.next_update(Duration::from_millis(500)) {
+            Ok(Some(update)) => {
                 devices = update;
                 announced_idle = false;
                 consecutive_failures = 0;
             }
-            Err(e) if is_timeout(&e) => {}
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!("device tracker lost: {e}; reconnecting");
                 devices.clear();
@@ -232,13 +295,65 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn is_timeout(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
-            matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            )
-        })
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    fn run(args: &[&str]) -> Args {
+        match parse(args) {
+            Ok(Command::Run(args)) => args,
+            other => panic!("expected a run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defaults_leave_device_tuning_free() {
+        let args = run(&[]);
+        assert_eq!(args.config.fps, 90);
+        assert!(!args.config.fps_explicit);
+        assert!(args.config.resolution.is_none());
+    }
+
+    #[test]
+    fn accepts_both_value_styles() {
+        let args = run(&["--fps", "60", "--bitrate=8000", "--position-y=-1200"]);
+        assert_eq!(args.config.fps, 60);
+        assert!(args.config.fps_explicit);
+        assert_eq!(args.config.bitrate_kbps, 8000);
+        assert_eq!(args.config.position_y, -1200);
+    }
+
+    #[test]
+    fn rejects_unknown_arguments_and_bad_values() {
+        for bad in [
+            &["--bitrat", "8000"][..],
+            &["--fps", "abc"],
+            &["--fps", "0"],
+            &["--fps"],
+            &["--target-usage", "9"],
+            &["--width", "70000", "--height", "1200"],
+            &["--width", "1920"],
+            &["--once=yes"],
+            &["--output-name", "a,b"],
+            &["--seconds", "0"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn seconds_implies_once_and_stats() {
+        let args = run(&["--seconds", "15"]);
+        assert_eq!(args.seconds, Some(15));
+        assert!(args.once && args.config.stats);
+    }
+
+    #[test]
+    fn help_is_recognised() {
+        assert!(matches!(parse(&["-h"]), Ok(Command::Help)));
+    }
 }

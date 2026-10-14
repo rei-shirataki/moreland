@@ -120,7 +120,7 @@ fn main() -> Result<()> {
     let _forward = adb::Forward::new(&device.serial, port, &format!("tcp:{DEVICE_PORT}"))?;
     println!("  forward     tcp:{port} -> tcp:{DEVICE_PORT}");
 
-    let header = stream_header(1920, 1200, 60);
+    let header = stream_header(1920, 1200, 60)?;
     let mut sender = Sender::connect(port, &header)?;
     println!("  connected, stream header sent");
 

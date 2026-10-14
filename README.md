@@ -315,16 +315,18 @@ Read before publishing or installing.
 **No network exposure.** `adb forward` binds `127.0.0.1` only. Nothing listens
 on an external interface, and no traffic leaves the machine or the USB cable.
 
-**The trust boundary is your local machine and your tablet.** Two consequences
-on a shared or multi-user system:
+**The trust boundary is your local machine and your tablet.** On a shared or
+multi-user system, any local process able to reach the forwarded `127.0.0.1`
+port (chosen by adb per session; `adb forward --list` shows it) can push
+frames to the tablet while the daemon is running.
 
-- Any local process able to reach `127.0.0.1:27183` can push frames to the
-  tablet while the daemon is running.
-- Any app on the tablet can connect to the `localabstract:moreland` socket.
-  Abstract Unix sockets carry no filesystem permissions.
+On the tablet, abstract Unix sockets carry no filesystem permissions, so the
+app does its own checks: it accepts connections only from adbd (the `shell` or
+`root` user), and the daemon gives it a fresh random socket name each session,
+so no other app can claim the name first and receive the desktop stream.
 
-Neither is exploitable for anything beyond drawing on the tablet's screen, and
-neither reaches back into the host. But this is a single-user desktop tool and
+The remaining exposure is not exploitable for anything beyond drawing on the
+tablet's screen, and does not reach back into the host. But this is a single-user desktop tool and
 is not hardened for a hostile local user.
 
 **The app requests no Android permissions at all** - not even `INTERNET`. It can

@@ -12,8 +12,13 @@ use anyhow::{bail, Context, Result};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
+use std::time::Duration;
 
 const ADB_SERVER: &str = "127.0.0.1:5037";
+
+/// How long a message, once begun, may take to arrive in full. The ADB server
+/// writes each one at once, so this only bounds a server that died mid-write.
+const MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
@@ -49,15 +54,33 @@ impl DeviceTracker {
         Ok(Self { stream })
     }
 
-    /// Block until the device list changes, then return it.
-    pub fn next_update(&mut self) -> Result<Vec<Device>> {
-        let payload = read_payload(&mut self.stream)?;
-        Ok(parse_devices(&payload))
-    }
+    /// Wait up to `wait` for the device list to change. `None` means it did
+    /// not, which is the normal case: the last list still stands.
+    ///
+    /// Only the wait for a message to *begin* is bounded by `wait`. A read
+    /// timeout that fired partway through `read_exact` would discard the bytes
+    /// already consumed and leave the stream mid-message, so the next read
+    /// would parse payload as a length. Peeking does not consume, and once a
+    /// message has started it is read whole.
+    pub fn next_update(&mut self, wait: Duration) -> Result<Option<Vec<Device>>> {
+        self.stream.set_read_timeout(Some(wait))?;
+        match self.stream.peek(&mut [0u8; 1]) {
+            Ok(0) => bail!("the ADB server closed the device tracker"),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(e).context("waiting for a device list update"),
+        }
 
-    pub fn set_timeout(&self, timeout: Option<std::time::Duration>) -> Result<()> {
-        self.stream.set_read_timeout(timeout)?;
-        Ok(())
+        self.stream.set_read_timeout(Some(MESSAGE_TIMEOUT))?;
+        let payload = read_payload(&mut self.stream)?;
+        Ok(Some(parse_devices(&payload)))
     }
 }
 
@@ -126,5 +149,46 @@ mod tests {
     #[test]
     fn empty_list_is_no_devices() {
         assert!(parse_devices("").is_empty());
+    }
+
+    fn tracker_with_server() -> (DeviceTracker, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (DeviceTracker { stream: client }, server)
+    }
+
+    #[test]
+    fn no_update_within_the_wait_is_not_an_error() {
+        let (mut tracker, _server) = tracker_with_server();
+        assert!(tracker.next_update(Duration::from_millis(20)).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_message_split_across_the_wait_is_read_whole() {
+        let (mut tracker, mut server) = tracker_with_server();
+        let payload = "ABCD1234\tdevice\n";
+        let writer = std::thread::spawn(move || {
+            // Length first, then the body well after the wait has elapsed.
+            write!(server, "{:04x}", payload.len()).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            server.write_all(payload.as_bytes()).unwrap();
+            write!(server, "{:04x}{}", payload.len(), payload).unwrap();
+            server
+        });
+
+        let first = tracker.next_update(Duration::from_millis(30)).unwrap();
+        assert_eq!(first.unwrap()[0].serial, "ABCD1234");
+        // Still aligned: the following message parses too.
+        let second = tracker.next_update(Duration::from_millis(500)).unwrap();
+        assert!(second.unwrap()[0].is_ready());
+        drop(writer.join().unwrap());
+    }
+
+    #[test]
+    fn a_closed_tracker_is_an_error() {
+        let (mut tracker, server) = tracker_with_server();
+        drop(server);
+        assert!(tracker.next_update(Duration::from_millis(200)).is_err());
     }
 }

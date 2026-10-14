@@ -33,10 +33,17 @@ pub const VERSION: u16 = 1;
 pub const STREAM_HEADER_LEN: usize = 16;
 pub const FRAME_HEADER_LEN: usize = 16;
 
-/// Default host-side port for `adb forward`.
+/// Host-side port for `adb forward` in the probes. The daemon lets adb pick a
+/// free port per session instead.
 pub const DEFAULT_PORT: u16 = 27183;
-/// Abstract Unix socket the device app listens on.
+/// Abstract Unix socket the device app listens on when launched by hand.
+///
+/// The daemon never uses it: any app on the device can bind an abstract name
+/// first, and a fixed one invites exactly that. Each session picks a fresh,
+/// unguessable name instead and hands it to the app in [`SOCKET_EXTRA`].
 pub const SOCKET_NAME: &str = "moreland";
+/// Intent string extra naming the socket the app should listen on.
+pub const SOCKET_EXTRA: &str = "com.moreland.display.SOCKET";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -104,6 +111,12 @@ impl StreamHeader {
 }
 
 pub const FLAG_KEYFRAME: u8 = 1 << 0;
+
+/// Largest frame payload the device accepts; it drops the connection on
+/// anything bigger rather than attempt the allocation. Mirrors
+/// `Protocol.MAX_FRAME_BYTES` in the Android app, so the host can refuse to
+/// send one instead of having the session die on the far side.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FrameHeader {

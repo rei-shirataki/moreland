@@ -70,12 +70,23 @@ pub struct Forward {
 }
 
 impl Forward {
+    /// Forward `local_port` to `remote`. Port 0 lets adb pick a free one,
+    /// which is what the daemon uses: a fixed port collides between two
+    /// devices or two daemons, and the second silently takes over the first's
+    /// forward. Read the result back with [`Forward::local_port`].
     pub fn new(serial: &str, local_port: u16, remote: &str) -> Result<Self> {
-        let local = format!("tcp:{local_port}");
-        // Clear any stale rule from a previous run before installing ours.
-        let _ = adb(&["-s", serial, "forward", "--remove", &local]);
-        adb(&["-s", serial, "forward", &local, remote])
-            .with_context(|| format!("forwarding {local} -> {remote}"))?;
+        let requested = format!("tcp:{local_port}");
+        if local_port != 0 {
+            // Clear any stale rule from a previous run before installing ours.
+            let _ = adb(&["-s", serial, "forward", "--remove", &requested]);
+        }
+        let out = adb(&["-s", serial, "forward", &requested, remote])
+            .with_context(|| format!("forwarding {requested} -> {remote}"))?;
+        let local = if local_port == 0 {
+            format!("tcp:{}", allocated_port(&out)?)
+        } else {
+            requested
+        };
         Ok(Self {
             serial: serial.to_string(),
             local,
@@ -94,6 +105,18 @@ impl Drop for Forward {
     fn drop(&mut self) {
         let _ = adb(&["-s", &self.serial, "forward", "--remove", &self.local]);
     }
+}
+
+/// `adb forward tcp:0 …` prints the port it allocated on stdout.
+fn allocated_port(out: &str) -> Result<u16> {
+    let port: u16 = out
+        .trim()
+        .parse()
+        .with_context(|| format!("adb did not report an allocated port: {out:?}"))?;
+    if port == 0 {
+        bail!("adb reported port 0 for a dynamic forward");
+    }
+    Ok(port)
 }
 
 pub fn shell(serial: &str, command: &str) -> Result<String> {
@@ -156,6 +179,14 @@ fn align2(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_port_adb_allocated() {
+        assert_eq!(allocated_port("41235\n").unwrap(), 41235);
+        assert!(allocated_port("").is_err());
+        assert!(allocated_port("0\n").is_err());
+        assert!(allocated_port("error: closed").is_err());
+    }
 
     #[test]
     fn scales_16_10_panel_cleanly() {

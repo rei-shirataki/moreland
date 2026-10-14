@@ -12,6 +12,10 @@ Type=simple
 ExecStart=%h/.local/bin/moreland
 Restart=on-failure
 RestartSec=5
+# 2: bad command line; 3: unsupported compositor. Neither changes on a
+# restart, and with RestartSec=5 the default start-rate limit never trips,
+# so without this the unit would relaunch forever.
+RestartPreventExitStatus=2 3
 
 # The daemon idles on `adb track-devices`, so it costs nothing while waiting
 # and does not need to be socket-activated.
