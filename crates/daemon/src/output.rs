@@ -334,6 +334,11 @@ fn restore_hyprland_monitor_state(
 pub struct VirtualOutput {
     compositor: Compositor,
     name: String,
+    /// Set when the session borrowed an output it did not create. It is put
+    /// back the way it was found on drop instead of being removed.
+    borrowed: Option<MonitorState>,
+    /// Dialect for that restore; only meaningful on Hyprland.
+    parser: HyprParser,
 }
 
 impl VirtualOutput {
@@ -369,14 +374,26 @@ impl VirtualOutput {
                 return Ok(Self {
                     compositor,
                     name: name.to_string(),
+                    borrowed: None,
+                    parser: HyprParser::Legacy,
                 });
             }
             Compositor::Hyprland => {
                 let saved_states = hyprland_monitor_state()
                     .context("saving Hyprland monitor state")?;
 
-                if saved_states.iter().any(|monitor| monitor.name == name) {
-                    tracing::debug!("reusing existing output {name}");
+                let existing = saved_states.iter().find(|monitor| monitor.name == name);
+                // An existing output by our own default name is one a crashed
+                // run left behind, so it is ours to remove. Anything else the
+                // user pointed us at — a monitor, a headless output they made
+                // themselves — is only borrowed for the session.
+                let borrowed = existing
+                    .filter(|_| name != capture::VIRTUAL_OUTPUT_NAME)
+                    .cloned();
+                if borrowed.is_some() {
+                    tracing::info!("borrowing existing output {name}; restored on exit");
+                } else if existing.is_some() {
+                    tracing::debug!("reusing leftover output {name}");
                 } else {
                     // Hyprland accepts an explicit name here, so the result is
                     // deterministic. Without one it allocates HEADLESS-N from a
@@ -390,9 +407,11 @@ impl VirtualOutput {
                 // From here on the output exists, so hold it in the guard
                 // before anything else can fail: an early `?` past this
                 // point would otherwise leave a phantom monitor behind.
-                let output = Self {
+                let mut output = Self {
                     compositor,
                     name: name.to_string(),
+                    borrowed,
+                    parser: HyprParser::Legacy,
                 };
 
                 let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},1");
@@ -417,6 +436,7 @@ impl VirtualOutput {
                 } else {
                     HyprParser::Legacy
                 };
+                output.parser = parser;
 
                 restore_hyprland_monitor_state(&saved_states, name, parser)
                     .context("restoring Hyprland monitor state")?;
@@ -432,6 +452,8 @@ impl VirtualOutput {
         Ok(Self {
             compositor,
             name: name.to_string(),
+            borrowed: None,
+            parser: HyprParser::Legacy,
         })
     }
 
@@ -449,6 +471,13 @@ impl VirtualOutput {
 
 impl Drop for VirtualOutput {
     fn drop(&mut self) {
+        if let Some(state) = &self.borrowed {
+            match restore_hyprland_monitor_state(std::slice::from_ref(state), "", self.parser) {
+                Ok(()) => tracing::debug!("restored borrowed output {}", self.name),
+                Err(e) => tracing::warn!("failed to restore output {}: {e:#}", self.name),
+            }
+            return;
+        }
         let result = match self.compositor {
             Compositor::Hyprland => run("hyprctl", &["output", "remove", &self.name]),
             Compositor::Sway => run("swaymsg", &["output", &self.name, "unplug"]),
