@@ -232,6 +232,40 @@ The most portable part of the project.
 - Nothing vendor-specific is required. The Qualcomm low-latency hint is set
   opportunistically and ignored elsewhere
 
+### HiSilicon Kirin 659 (Huawei AGS2-W09, `ro.board.platform = hi6250`) — works, tuned
+
+Verified on Android 11 (API 30) against an Intel Iris Xe host on Hyprland.
+
+- The decoder is `OMX.IMG.MSVDX.Decoder.AVC`. It rejects `KEY_LOW_LATENCY`
+  with `ERROR_UNSUPPORTED`, so the app falls back through its hint ladder and
+  starts with realtime priority and operating rate only.
+- It decodes about **60 fps at 1920×1200** whatever rate is offered: 90 fps
+  delivered the same ~1135 frames in a 19 s animation and only added latency.
+- Without a bound on frames in flight the host queues behind it. A full-screen
+  animation measured a 285 ms median round trip (p95 550 ms) against 11 ms at
+  best.
+
+Defaults applied when the device reports `hi6250` (each overridden by the
+matching flag): **60 fps, 12000 kbps, 2 frames in flight**.
+
+Measured with a full-screen animation, 30 s per run, 60 fps / 12000 kbps unless
+noted:
+
+| Change | Frames delivered | Median | p95 |
+|---|---|---|---|
+| 3 in flight | 1139 | 34.0 ms | 46.5 ms |
+| **2 in flight** | **1138** | **17.9 ms** | **28.1 ms** |
+| 1 in flight | 602 | 16.3 ms | 20.8 ms |
+| 90 fps, 2 in flight | 1135 | 22.8 ms | 33.0 ms |
+| 50 fps, 2 in flight | 982 | 20.2 ms | 22.8 ms |
+| bitrate 8000 / 20000 | 1138 / 1134 | 33.9 / 34.1 ms | 46.4 / 49.3 ms |
+| `--cavlc` | 1137 | 34.0 ms | 49.8 ms |
+| `--target-usage 1` | 1139 | 33.8 ms | 45.5 ms |
+
+Bitrate, entropy coding and `target-usage` do not move latency here; the
+decoder is limited by frame throughput, not by the bitstream. Occasional
+outliers of 100–300 ms remain at the start of motion.
+
 The default **1920×1200** is appropriate for a 16:10 display. For a 16:9
 tablet, prefer `--width 1920 --height 1080`; a mismatched aspect ratio may
 letterbox.

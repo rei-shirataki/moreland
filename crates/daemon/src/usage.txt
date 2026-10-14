@@ -15,6 +15,9 @@ OPTIONS
                         120 measures better still; 144 saturates
                         Kirin 659 tablets (hi6250) default to 60 instead
     --bitrate <KBPS>    H.264 target bitrate           [default: 20000; 12000 on hi6250]
+    --max-in-flight <N> unacknowledged frames before dropping [default: 3; 2 on hi6250]
+    --cavlc             CAVLC instead of CABAC (cheaper for weak decoders)
+    --target-usage <N>  encoder speed/quality, 1..7       [default: 3]
     --position <X>      x offset of the virtual output [default: 0]
     --position-y <Y>    y offset of the virtual output [default: 1080]
                         default sits below a primary at 0x0, no taller than

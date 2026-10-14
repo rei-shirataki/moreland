@@ -49,6 +49,12 @@ fn parse_args() -> Args {
                 config.bitrate_kbps = next_u32(20_000);
                 config.bitrate_explicit = true;
             }
+            "--max-in-flight" => {
+                config.max_in_flight = next_u32(3).max(1) as usize;
+                config.max_in_flight_explicit = true;
+            }
+            "--cavlc" => config.cabac = false,
+            "--target-usage" => config.target_usage = next_u32(3).clamp(1, 7),
             "--position" => {
                 config.position_x = it
                     .next()

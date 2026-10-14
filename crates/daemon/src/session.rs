@@ -26,7 +26,7 @@ const APP_ACTIVITY: &str = "com.moreland.display/.DisplayActivity";
 /// 285 ms median round trip against 11 ms at best. Capping the pipeline and
 /// dropping the surplus *before* encoding keeps latency at roughly this many
 /// frame times instead, at the cost of showing fewer frames.
-const MAX_IN_FLIGHT: usize = 3;
+const DEFAULT_MAX_IN_FLIGHT: usize = 3;
 
 /// With no acknowledgement for this long, assume the device is not rendering
 /// (surface detached, app backgrounded) and stop gating on it. Frames are
@@ -41,10 +41,17 @@ pub struct Config {
     pub max_width: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// Unacknowledged frames allowed in flight; see `DEFAULT_MAX_IN_FLIGHT`.
+    pub max_in_flight: usize,
+    /// CABAC entropy coding. CAVLC is cheaper for a weak decoder to parse.
+    pub cabac: bool,
+    /// Encoder speed/quality balance, 1 (quality) .. 7 (speed).
+    pub target_usage: u32,
     /// Set when the user passed `--fps` / `--bitrate`; device tuning never
     /// overrides an explicit choice.
     pub fps_explicit: bool,
     pub bitrate_explicit: bool,
+    pub max_in_flight_explicit: bool,
     pub position_x: i32,
     pub position_y: i32,
     pub output_name: String,
@@ -67,8 +74,12 @@ impl Default for Config {
             // saturates: 163 of 1764 frames unacked and a 208 ms stall.
             fps: 90,
             bitrate_kbps: 20_000,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            cabac: true,
+            target_usage: 3,
             fps_explicit: false,
             bitrate_explicit: false,
+            max_in_flight_explicit: false,
             // Below a primary at 0x0, starting at y = 1080. This assumes the
             // primary is no taller than 1080px — on a taller display the
             // virtual output would overlap it rather than sit below. Override
@@ -100,10 +111,20 @@ impl Config {
             if !tuned.bitrate_explicit {
                 tuned.bitrate_kbps = 12_000;
             }
+            // Measured with a full-screen animation: the MSVDX decoder tops
+            // out near 60 fps whatever the offered rate (90 fps delivered the
+            // same ~1135 frames and only added latency), so latency tracks
+            // the in-flight depth. 2 keeps every frame the decoder can take at
+            // an 18 ms median; 3 gives 34 ms, 1 halves the delivered frames.
+            // Bitrate, CAVLC and target-usage made no measurable difference.
+            if !tuned.max_in_flight_explicit {
+                tuned.max_in_flight = 2;
+            }
             tracing::info!(
-                "device profile hi6250 (Kirin 659): {} fps, {} kbps",
+                "device profile hi6250 (Kirin 659): {} fps, {} kbps, {} in flight",
                 tuned.fps,
-                tuned.bitrate_kbps
+                tuned.bitrate_kbps,
+                tuned.max_in_flight
             );
         }
         tuned
@@ -240,6 +261,8 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         height: capture.height,
         framerate: config.fps,
         bitrate_kbps: config.bitrate_kbps,
+        cabac: config.cabac,
+        target_usage: config.target_usage,
         fourcc: capture.format,
         modifier: capture.modifier.unwrap_or(0),
         ..Default::default()
@@ -333,7 +356,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
             // while one already queued toward a slow decoder is latency.
             {
                 let mut in_flight = sent_at.lock().unwrap();
-                if in_flight.len() >= MAX_IN_FLIGHT {
+                if in_flight.len() >= config.max_in_flight {
                     if last_ack.lock().unwrap().elapsed() < ACK_STALL {
                         dropped += 1;
                         continue;
@@ -359,7 +382,13 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     let _ = ack_thread.join();
 
     if config.stats {
-        report(&round_trips.lock().unwrap(), index, dropped, sender.bytes_sent());
+        report(
+            &round_trips.lock().unwrap(),
+            index,
+            dropped,
+            config.max_in_flight,
+            sender.bytes_sent(),
+        );
     }
 
     // Leaving the app in the foreground with a dead socket is confusing; send
@@ -371,9 +400,9 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     result.and(send_result)
 }
 
-fn report(trips: &[Duration], frames: u64, dropped: u64, bytes: u64) {
+fn report(trips: &[Duration], frames: u64, dropped: u64, max_in_flight: usize, bytes: u64) {
     println!("\n  frames captured   {frames}");
-    println!("  frames dropped    {dropped}  (kept under {MAX_IN_FLIGHT} in flight)");
+    println!("  frames dropped    {dropped}  (kept under {max_in_flight} in flight)");
     println!("  bytes sent        {:.1} MB", bytes as f64 / 1e6);
     println!("  acks received     {}", trips.len());
     if trips.is_empty() {
