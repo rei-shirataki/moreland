@@ -183,7 +183,8 @@ pub const TOUCH_LEN: usize = 1 + 1 + 1 + 2 + 2;
 /// Touch coordinates run `0..=TOUCH_EXTENT` across the streamed image.
 pub const TOUCH_EXTENT: u16 = u16::MAX;
 
-/// Simultaneous contacts carried. Slots at or above this are refused.
+/// Simultaneous contacts carried. Touches on slots at or above this are
+/// skipped.
 pub const MAX_TOUCH_SLOTS: u8 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +233,10 @@ pub enum DeviceMessage {
     /// The device's display changed size, usually because it was rotated.
     Orientation { width: u16, height: u16 },
     Touch(TouchEvent),
+    /// A well-framed message carrying values this side does not know — a
+    /// touch with a newer action or a slot past `MAX_TOUCH_SLOTS`. Its length
+    /// is fixed, so it is consumed and the stream carries on.
+    Unsupported,
 }
 
 pub fn encode_orientation(width: u16, height: u16) -> [u8; ORIENTATION_LEN] {
@@ -254,7 +259,9 @@ pub fn encode_ack(pts_ns: u64) -> [u8; ACK_LEN] {
 /// Returns `Ok(None)` when `buf` holds only part of a message, so the caller
 /// can read more and retry, and otherwise the message with the number of bytes
 /// it occupied. An unknown tag is an error: the stream has no framing to
-/// resynchronise on, so the connection cannot be trusted past it.
+/// resynchronise on, so the connection cannot be trusted past it. Unknown
+/// values inside a known, fixed-length message are not: they come back as
+/// `DeviceMessage::Unsupported`.
 pub fn parse_device_message(buf: &[u8]) -> Result<Option<(DeviceMessage, usize)>> {
     let Some(&tag) = buf.first() else {
         return Ok(None);
@@ -281,15 +288,16 @@ pub fn parse_device_message(buf: &[u8]) -> Result<Option<(DeviceMessage, usize)>
             if buf.len() < TOUCH_LEN {
                 return Ok(None);
             }
+            let (Ok(action), slot @ 0..MAX_TOUCH_SLOTS) = (TouchAction::from_u8(buf[1]), buf[2])
+            else {
+                return Ok(Some((DeviceMessage::Unsupported, TOUCH_LEN)));
+            };
             let event = TouchEvent {
-                action: TouchAction::from_u8(buf[1])?,
-                slot: buf[2],
+                action,
+                slot,
                 x: u16::from_be_bytes([buf[3], buf[4]]),
                 y: u16::from_be_bytes([buf[5], buf[6]]),
             };
-            if event.slot >= MAX_TOUCH_SLOTS {
-                bail!("touch slot {} out of range", event.slot);
-            }
             Ok(Some((DeviceMessage::Touch(event), TOUCH_LEN)))
         }
         other => bail!("unknown device message tag 0x{other:02x}"),
@@ -373,20 +381,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_tags_actions_and_slots() {
+    fn rejects_unknown_tags() {
         assert!(parse_device_message(&[0xff]).is_err());
-        let mut touch = TouchEvent {
+    }
+
+    #[test]
+    fn skips_touches_with_unknown_actions_or_slots() {
+        let touch = TouchEvent {
             action: TouchAction::Down,
             slot: 0,
             x: 0,
             y: 0,
         }
         .encode();
-        touch[1] = 9;
-        assert!(parse_device_message(&touch).is_err());
-        touch[1] = 0;
-        touch[2] = MAX_TOUCH_SLOTS;
-        assert!(parse_device_message(&touch).is_err());
+        let mut bad_action = touch;
+        bad_action[1] = 9;
+        let mut bad_slot = touch;
+        bad_slot[2] = MAX_TOUCH_SLOTS;
+        for bad in [bad_action, bad_slot] {
+            let mut wire = bad.to_vec();
+            wire.extend_from_slice(&encode_ack(5));
+            assert_eq!(
+                parse_device_message(&wire).unwrap(),
+                Some((DeviceMessage::Unsupported, TOUCH_LEN))
+            );
+            assert_eq!(
+                parse_device_message(&wire[TOUCH_LEN..]).unwrap(),
+                Some((DeviceMessage::Ack { pts_ns: 5 }, ACK_LEN))
+            );
+        }
     }
 
     #[test]
