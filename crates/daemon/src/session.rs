@@ -26,6 +26,10 @@ pub struct Config {
     pub max_width: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// Set when the user passed `--fps` / `--bitrate`; device tuning never
+    /// overrides an explicit choice.
+    pub fps_explicit: bool,
+    pub bitrate_explicit: bool,
     pub position_x: i32,
     pub position_y: i32,
     pub output_name: String,
@@ -48,6 +52,8 @@ impl Default for Config {
             // saturates: 163 of 1764 frames unacked and a 208 ms stall.
             fps: 90,
             bitrate_kbps: 20_000,
+            fps_explicit: false,
+            bitrate_explicit: false,
             // Below a primary at 0x0, starting at y = 1080. This assumes the
             // primary is no taller than 1080px — on a taller display the
             // virtual output would overlap it rather than sit below. Override
@@ -62,6 +68,33 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Apply per-device defaults for hardware known to need them.
+    ///
+    /// The 90 fps default was measured on a Qualcomm tablet. HiSilicon
+    /// Kirin 659 (`hi6250`) decodes through an IMG MSVDX block that rejects
+    /// `KEY_LOW_LATENCY` and is built for 1080p-class streams, so 1920x1200 at
+    /// 90 fps backs up its input queue and latency climbs instead of falling.
+    fn tuned_for(&self, serial: &str) -> Config {
+        let mut tuned = self.clone();
+        let platform = adb::shell(serial, "getprop ro.board.platform").unwrap_or_default();
+        if platform.trim() == "hi6250" {
+            if !tuned.fps_explicit {
+                tuned.fps = 60;
+            }
+            if !tuned.bitrate_explicit {
+                tuned.bitrate_kbps = 12_000;
+            }
+            tracing::info!(
+                "device profile hi6250 (Kirin 659): {} fps, {} kbps",
+                tuned.fps,
+                tuned.bitrate_kbps
+            );
+        }
+        tuned
+    }
+}
+
 pub fn app_installed(serial: &str) -> Result<bool> {
     let out = adb::shell(serial, &format!("pm list packages {APP_PACKAGE}"))?;
     Ok(out.contains(APP_PACKAGE))
@@ -72,6 +105,7 @@ pub fn app_installed(serial: &str) -> Result<bool> {
 /// Every resource here is RAII-scoped: the virtual output and the adb forward
 /// are removed when this function returns, however it returns.
 pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
+    let config = &config.tuned_for(serial);
     if !app_installed(serial)? {
         bail!(
             "app not installed on the tablet.\n\
