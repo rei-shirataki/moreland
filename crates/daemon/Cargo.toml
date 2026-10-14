@@ -14,6 +14,7 @@ capture.workspace = true
 encoder.workspace = true
 transport.workspace = true
 protocol.workspace = true
+libc = "0.2"
 
 [[bin]]
 name = "moreland"

@@ -37,6 +37,7 @@ class VideoStream(private val socketName: String) {
         const val TAG = "Moreland"
         const val INPUT_TIMEOUT_MS = 2000L
         const val SURFACE_WAIT_MS = 5000L
+        const val MAX_QUEUED_MOVES = 256
     }
 
     @Volatile private var running = false
@@ -49,7 +50,15 @@ class VideoStream(private val socketName: String) {
     private var ackThread: Thread? = null
 
     private val freeInputs = LinkedBlockingQueue<Int>()
-    private val pendingAcks = LinkedBlockingQueue<Long>()
+
+    /** Encoded device → host messages (acks and touches), drained by one writer thread. */
+    private val outgoing = LinkedBlockingQueue<ByteArray>()
+
+    /** Contacts the host believes are down, so they can be lifted if the view goes away. */
+    private val activeTouches = BooleanArray(Protocol.MAX_TOUCH_SLOTS)
+
+    /** True only while a connection is being served; touches are dropped otherwise. */
+    @Volatile private var connected = false
 
     @Volatile var framesDecoded: Long = 0; private set
     @Volatile var lastError: String? = null; private set
@@ -73,6 +82,42 @@ class VideoStream(private val socketName: String) {
         if (surface != null && surface.isValid) {
             runCatching { codec.setOutputSurface(surface) }
                 .onFailure { Log.w(TAG, "setOutputSurface failed: ${it.message}") }
+        }
+    }
+
+    /**
+     * Forward one contact to the host. Safe from any thread; never blocks.
+     *
+     * [x] and [y] are already normalised to `0..Protocol.TOUCH_EXTENT` across
+     * the streamed image.
+     */
+    fun sendTouch(action: Int, slot: Int, x: Int, y: Int) {
+        if (!connected || slot !in 0 until Protocol.MAX_TOUCH_SLOTS) return
+        synchronized(activeTouches) {
+            when (action) {
+                Protocol.TOUCH_DOWN -> activeTouches[slot] = true
+                Protocol.TOUCH_UP -> {
+                    if (!activeTouches[slot]) return
+                    activeTouches[slot] = false
+                }
+                else -> if (!activeTouches[slot]) return
+            }
+        }
+        // A move is superseded by the next one. Shed them rather than let a
+        // stalled socket build a backlog that then plays back as lag.
+        if (action == Protocol.TOUCH_MOVE && outgoing.size > MAX_QUEUED_MOVES) return
+        outgoing.offer(Protocol.encodeTouch(action, slot, x, y))
+    }
+
+    /** Lift every contact the host still thinks is down. */
+    fun releaseTouches() {
+        synchronized(activeTouches) {
+            for (slot in activeTouches.indices) {
+                if (activeTouches[slot]) {
+                    activeTouches[slot] = false
+                    outgoing.offer(Protocol.encodeTouch(Protocol.TOUCH_UP, slot, 0, 0))
+                }
+            }
         }
     }
 
@@ -159,11 +204,14 @@ class VideoStream(private val socketName: String) {
 
         val target = awaitSurface()
         freeInputs.clear()
-        pendingAcks.clear()
+        outgoing.clear()
+        // A new connection means a new injector on the host, with nothing down.
+        synchronized(activeTouches) { activeTouches.fill(false) }
 
         val codec = configureCodec(header, target)
         this.codec = codec
         startAckWriter(output)
+        connected = true
 
         try {
             var scratch = ByteArray(256 * 1024)
@@ -188,6 +236,7 @@ class VideoStream(private val socketName: String) {
                 codec.queueInputBuffer(index, 0, frame.length, frame.ptsNs / 1000, flags)
             }
         } finally {
+            connected = false
             this.codec = null
             runCatching { codec.stop() }
             runCatching { codec.release() }
@@ -261,7 +310,7 @@ class VideoStream(private val socketName: String) {
                     runCatching { codec.releaseOutputBuffer(index, render) }
                     if (render) {
                         framesDecoded++
-                        pendingAcks.offer(info.presentationTimeUs * 1000)
+                        outgoing.offer(Protocol.encodeAck(info.presentationTimeUs * 1000))
                     }
                 }
 
@@ -286,15 +335,15 @@ class VideoStream(private val socketName: String) {
     }
 
     /**
-     * Acknowledges rendered frames on a dedicated thread so a slow or blocked
-     * write can never stall a decoder callback.
+     * Sends acknowledgements and touches on a dedicated thread so a slow or
+     * blocked write can never stall a decoder callback or the UI thread.
      */
     private fun startAckWriter(output: OutputStream) {
         ackThread = Thread({
             try {
                 while (running && !Thread.currentThread().isInterrupted) {
-                    val pts = pendingAcks.poll(500, TimeUnit.MILLISECONDS) ?: continue
-                    output.write(Protocol.encodeAck(pts))
+                    val message = outgoing.poll(500, TimeUnit.MILLISECONDS) ?: continue
+                    output.write(message)
                     output.flush()
                 }
             } catch (e: Exception) {

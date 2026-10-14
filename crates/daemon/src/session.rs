@@ -13,6 +13,7 @@ use transport::{adb, stream_header, Sender};
 
 use crate::inflight::InFlight;
 use crate::output::VirtualOutput;
+use crate::touch::{self, TouchInjector};
 
 const APP_PACKAGE: &str = "com.moreland.display";
 const APP_ACTIVITY: &str = "com.moreland.display/.DisplayActivity";
@@ -56,6 +57,8 @@ pub struct Config {
     pub output_name: String,
     /// Composite the mouse cursor into the streamed frames.
     pub paint_cursor: bool,
+    /// Replay the tablet's touches on the host through uinput.
+    pub touch: bool,
     /// Emit round-trip latency statistics on exit.
     pub stats: bool,
 }
@@ -88,6 +91,7 @@ impl Default for Config {
             position_y: 1080,
             output_name: capture::VIRTUAL_OUTPUT_NAME.to_string(),
             paint_cursor: false,
+            touch: true,
             stats: false,
         }
     }
@@ -297,6 +301,33 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     let round_trips: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
     let last_ack: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
+    // Created after the output exists so the compositor can bind the device to
+    // it. Touch is optional: without /dev/uinput access the display still works.
+    let mut touch_in = if config.touch {
+        match TouchInjector::create() {
+            Ok(injector) => {
+                // Hyprland discovers the device asynchronously; give it a
+                // moment before naming it in a rule.
+                std::thread::sleep(Duration::from_millis(300));
+                if let Err(e) = output.bind_input_device(touch::DEVICE_NAME) {
+                    tracing::warn!(
+                        "touch is on, but could not be bound to {}: {e:#}\n\
+                         map {} to that output in your compositor config",
+                        output.name(),
+                        touch::DEVICE_NAME
+                    );
+                }
+                Some(injector)
+            }
+            Err(e) => {
+                tracing::warn!("touch disabled: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let ack_thread = {
         let last_ack = Arc::clone(&last_ack);
         let mut reader = sender.ack_reader()?;
@@ -304,24 +335,48 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         let round_trips = Arc::clone(&round_trips);
         let running = Arc::clone(&running);
         std::thread::spawn(move || {
-            let mut buf = [0u8; protocol::ACK_LEN];
-            let mut filled = 0usize;
-            while running.load(Ordering::Relaxed) {
-                match reader.read(&mut buf[filled..]) {
+            // Messages are small and fixed-length per tag; a reply can arrive
+            // split across reads, so keep what has not parsed yet.
+            let mut pending: Vec<u8> = Vec::with_capacity(256);
+            let mut chunk = [0u8; 256];
+            'read: while running.load(Ordering::Relaxed) {
+                match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
-                        filled += n;
-                        if filled == protocol::ACK_LEN {
-                            filled = 0;
-                            let now = Instant::now();
-                            *last_ack.lock().unwrap() = now;
-                            let rtt = protocol::decode_ack(&buf)
-                                .ok()
-                                .and_then(|pts| in_flight.lock().unwrap().ack(pts, now));
-                            if let Some(rtt) = rtt {
-                                round_trips.lock().unwrap().push(rtt);
+                        pending.extend_from_slice(&chunk[..n]);
+                        let mut consumed = 0usize;
+                        loop {
+                            match protocol::parse_device_message(&pending[consumed..]) {
+                                Ok(Some((message, used))) => {
+                                    consumed += used;
+                                    match message {
+                                        protocol::DeviceMessage::Ack { pts_ns } => {
+                                            let now = Instant::now();
+                                            *last_ack.lock().unwrap() = now;
+                                            let rtt = in_flight.lock().unwrap().ack(pts_ns, now);
+                                            if let Some(rtt) = rtt {
+                                                round_trips.lock().unwrap().push(rtt);
+                                            }
+                                        }
+                                        protocol::DeviceMessage::Touch(event) => {
+                                            if let Some(injector) = touch_in.as_mut() {
+                                                if let Err(e) = injector.inject(event) {
+                                                    tracing::warn!("touch injection failed: {e:#}");
+                                                    touch_in = None;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    // No framing to resynchronise on.
+                                    tracing::warn!("device sent garbage, closing: {e:#}");
+                                    break 'read;
+                                }
                             }
                         }
+                        pending.drain(..consumed);
                     }
                     Err(e)
                         if matches!(

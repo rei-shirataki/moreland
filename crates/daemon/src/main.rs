@@ -12,6 +12,7 @@
 mod inflight;
 mod output;
 mod session;
+mod touch;
 mod tracker;
 
 use anyhow::Result;
@@ -117,6 +118,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
                 config.output_name = name;
             }
             "--show-cursor" => config.paint_cursor = true,
+            "--no-touch" => config.touch = false,
             "--once" => once = true,
             "--stats" => config.stats = true,
             "--seconds" => {

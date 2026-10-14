@@ -121,6 +121,7 @@ dependencies = [
  "anyhow",
  "capture",
  "encoder",
+ "libc",
  "protocol",
  "serde_json",
  "signal-hook",

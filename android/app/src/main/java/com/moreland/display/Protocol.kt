@@ -36,11 +36,11 @@ object Protocol {
     fun isTrustedPeer(uid: Int): Boolean = uid == SHELL_UID || uid == ROOT_UID
 
     private const val MAGIC = 0x4D524C44 // "MRLD"
-    const val VERSION = 1
+    const val VERSION = 2
 
     const val STREAM_HEADER_LEN = 16
     const val FRAME_HEADER_LEN = 16
-    const val ACK_LEN = 8
+    const val ACK_LEN = 1 + 8
 
     const val FLAG_KEYFRAME = 0x01
 
@@ -106,7 +106,33 @@ object Protocol {
         }
     }
 
+    /** Tag byte introducing each device → host message. */
+    const val TAG_ACK = 0x01
+    const val TAG_TOUCH = 0x02
+
+    /** Touch coordinates run 0..TOUCH_EXTENT across the streamed image. */
+    const val TOUCH_EXTENT = 65535
+
+    /** Simultaneous contacts the host accepts; higher pointer ids are ignored. */
+    const val MAX_TOUCH_SLOTS = 10
+
+    const val TOUCH_DOWN = 0
+    const val TOUCH_MOVE = 1
+    const val TOUCH_UP = 2
+
+    /** Tag, action, slot, x u16, y u16 — mirrors `protocol::TouchEvent::encode`. */
+    fun encodeTouch(action: Int, slot: Int, x: Int, y: Int): ByteArray = byteArrayOf(
+        TAG_TOUCH.toByte(),
+        action.toByte(),
+        slot.toByte(),
+        (x ushr 8).toByte(),
+        x.toByte(),
+        (y ushr 8).toByte(),
+        y.toByte(),
+    )
+
     fun encodeAck(ptsNs: Long): ByteArray = byteArrayOf(
+        TAG_ACK.toByte(),
         (ptsNs ushr 56).toByte(),
         (ptsNs ushr 48).toByte(),
         (ptsNs ushr 40).toByte(),
