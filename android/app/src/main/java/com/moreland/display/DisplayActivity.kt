@@ -7,12 +7,14 @@ import android.content.res.Configuration
 import android.graphics.Point
 import android.graphics.Color
 import android.os.Bundle
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
+import kotlin.math.roundToInt
 
 /**
  * Fullscreen host for the decoded stream.
@@ -52,7 +54,44 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
         val socketName = Protocol.socketName(intent.getStringExtra(Protocol.SOCKET_EXTRA))
         stream = VideoStream(socketName).also { it.start() }
         surfaceView.holder.addCallback(this)
+        @Suppress("ClickableViewAccessibility")
+        surfaceView.setOnTouchListener { view, event -> forwardTouch(view, event) }
         goImmersive()
+    }
+
+    /**
+     * Report contacts to the host in coordinates normalised across the view.
+     *
+     * The decoder output is stretched to fill the SurfaceView, so the view's
+     * own bounds are the image's bounds and no letterbox correction applies.
+     */
+    private fun forwardTouch(view: View, event: MotionEvent): Boolean {
+        val stream = stream ?: return false
+        val width = view.width
+        val height = view.height
+        if (width <= 0 || height <= 0) return false
+
+        fun send(action: Int, index: Int) {
+            val x = (event.getX(index) / width * Protocol.TOUCH_EXTENT).roundToInt()
+            val y = (event.getY(index) / height * Protocol.TOUCH_EXTENT).roundToInt()
+            stream.sendTouch(
+                action,
+                event.getPointerId(index),
+                x.coerceIn(0, Protocol.TOUCH_EXTENT),
+                y.coerceIn(0, Protocol.TOUCH_EXTENT),
+            )
+        }
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN ->
+                send(Protocol.TOUCH_DOWN, event.actionIndex)
+            MotionEvent.ACTION_MOVE ->
+                for (index in 0 until event.pointerCount) send(Protocol.TOUCH_MOVE, index)
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP ->
+                send(Protocol.TOUCH_UP, event.actionIndex)
+            MotionEvent.ACTION_CANCEL -> stream.releaseTouches()
+        }
+        return true
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -102,6 +141,8 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        // The view no longer receives the matching ups for contacts in flight.
+        stream?.releaseTouches()
         stream?.setSurface(null)
     }
 

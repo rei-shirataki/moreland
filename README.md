@@ -292,10 +292,31 @@ rules are discarded on config reload, and with no static entry the output falls
 back to `auto` scale mid-session. A rule for an absent output is simply stored,
 so it is harmless while the tablet is unplugged.
 
+## Touch input
+
+Touches on the tablet are replayed on the host as a multi-touch screen
+(`moreland-touch`, created through `/dev/uinput`), so taps, drags and pinch
+gestures work on the virtual output. The daemon needs write access to
+`/dev/uinput`. Most distributions give it to the `input` group:
+
+```sh
+ls -l /dev/uinput                    # crw-rw---- root input ...
+sudo usermod -aG input "$USER"       # then log in again
+```
+
+If it is not writable, the daemon logs `touch disabled: ...` and carries on
+with video only. `--no-touch` turns the feature off explicitly.
+
+The device has to be bound to the virtual output, or its coordinates would
+span the whole desktop. On Hyprland the daemon does this itself; on other
+compositors map `moreland-touch` to the output named by `--output-name` in the
+compositor's own input settings.
+
 ## Known limitations
 
-- **No touch or pen input.** The tablet is a display only. `zwlr_virtual_pointer_v1`
-  would add absolute-pointer input without root; true multi-touch needs `uinput`.
+- **Touch is multi-touch only, no pen.** See [Touch input](#touch-input). Pressure,
+  tilt and stylus buttons are not forwarded. Edge swipes belong to Android's
+  immersive mode and never reach the host.
 - **The app must stay foregrounded.** Switching apps on the tablet stops the stream.
 - **No audio.** Video only.
 - **Idle output drops to ~1 fps.** Correct, not a bug: Hyprland does not render a
@@ -383,7 +404,8 @@ Especially wanted:
   most requested
 - **A portal/PipeWire capture backend**, which would make GNOME and KDE work at once
 - **Intel and NVIDIA reports**, positive or negative
-- **Touch input** via `zwlr_virtual_pointer_v1`
+- **Touch reports**: device-to-output binding on compositors other than Hyprland,
+  and pen/stylus input
 
 Please include your compositor, GPU, driver version, and tablet model. A
 documented failure is more useful than silence.

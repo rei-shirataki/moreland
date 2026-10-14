@@ -482,6 +482,43 @@ impl VirtualOutput {
         &self.name
     }
 
+    /// Bind an input device (a touchscreen) to this output, so its absolute
+    /// coordinates cover this output instead of the whole desktop.
+    ///
+    /// Only Hyprland can be told at runtime; elsewhere the user maps the
+    /// device in their compositor config, and the error says so.
+    pub fn bind_input_device(&self, device: &str) -> Result<()> {
+        match self.compositor {
+            Compositor::Hyprland => {
+                let rule = match self.parser {
+                    HyprParser::Legacy => vec![
+                        "keyword".to_string(),
+                        format!("device[{device}]:output"),
+                        self.name.clone(),
+                    ],
+                    HyprParser::Lua => vec![
+                        "eval".to_string(),
+                        format!(
+                            "hl.device({{ name = {}, output = {} }})",
+                            lua_string(device),
+                            lua_string(&self.name)
+                        ),
+                    ],
+                };
+                let args: Vec<&str> = rule.iter().map(String::as_str).collect();
+                let reply = run("hyprctl", &args)?;
+                // As with monitor rules, a refusal can arrive on stdout with
+                // a zero exit status.
+                let reply = reply.trim();
+                if !reply.is_empty() && reply != "ok" {
+                    bail!("hyprctl said {reply:?}");
+                }
+                Ok(())
+            }
+            other => bail!("{} cannot bind input devices at runtime", other.name()),
+        }
+    }
+
     /// Change the mode of the output while it stays in the layout, for a tablet
     /// that was rotated. Returns false when this compositor leaves the output
     /// alone (labwc), in which case the caller keeps the size it has.

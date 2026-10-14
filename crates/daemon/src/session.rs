@@ -13,6 +13,7 @@ use transport::{adb, stream_header, Sender};
 
 use crate::inflight::InFlight;
 use crate::output::VirtualOutput;
+use crate::touch::{self, TouchInjector};
 
 const APP_PACKAGE: &str = "com.moreland.display";
 const APP_ACTIVITY: &str = "com.moreland.display/.DisplayActivity";
@@ -56,6 +57,8 @@ pub struct Config {
     pub output_name: String,
     /// Composite the mouse cursor into the streamed frames.
     pub paint_cursor: bool,
+    /// Replay the tablet's touches on the host through uinput.
+    pub touch: bool,
     /// Emit round-trip latency statistics on exit.
     pub stats: bool,
 }
@@ -88,6 +91,7 @@ impl Default for Config {
             position_y: 1080,
             output_name: capture::VIRTUAL_OUTPUT_NAME.to_string(),
             paint_cursor: false,
+            touch: true,
             stats: false,
         }
     }
@@ -310,6 +314,33 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     // The device's latest reported display size, until the loop acts on it.
     let reported: Arc<Mutex<Option<(u16, u16)>>> = Arc::new(Mutex::new(None));
 
+    // Created after the output exists so the compositor can bind the device to
+    // it. Touch is optional: without /dev/uinput access the display still works.
+    let mut touch_in = if config.touch {
+        match TouchInjector::create() {
+            Ok(injector) => {
+                // Hyprland discovers the device asynchronously; give it a
+                // moment before naming it in a rule.
+                std::thread::sleep(Duration::from_millis(300));
+                if let Err(e) = output.bind_input_device(touch::DEVICE_NAME) {
+                    tracing::warn!(
+                        "touch is on, but could not be bound to {}: {e:#}\n\
+                         map {} to that output in your compositor config",
+                        output.name(),
+                        touch::DEVICE_NAME
+                    );
+                }
+                Some(injector)
+            }
+            Err(e) => {
+                tracing::warn!("touch disabled: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let ack_thread = {
         let last_ack = Arc::clone(&last_ack);
         let mut reader = sender.ack_reader()?;
@@ -318,30 +349,52 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         let alive = Arc::clone(&alive);
         let reported = Arc::clone(&reported);
         std::thread::spawn(move || {
-            let mut pending: Vec<u8> = Vec::new();
-            let mut chunk = [0u8; 64];
-            while alive.load(Ordering::Relaxed) {
+            // Messages are small and fixed-length per tag; one can arrive
+            // split across reads, so keep what has not parsed yet.
+            let mut pending: Vec<u8> = Vec::with_capacity(256);
+            let mut chunk = [0u8; 256];
+            'read: while alive.load(Ordering::Relaxed) {
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
                         pending.extend_from_slice(&chunk[..n]);
-                        while let Some((message, used)) =
-                            protocol::decode_device_message(&pending)
-                        {
-                            pending.drain(..used);
-                            match message {
-                                protocol::DeviceMessage::Ack(pts) => {
-                                    let now = Instant::now();
-                                    *last_ack.lock().unwrap() = now;
-                                    if let Some(rtt) = in_flight.lock().unwrap().ack(pts, now) {
-                                        round_trips.lock().unwrap().push(rtt);
+                        let mut consumed = 0usize;
+                        loop {
+                            match protocol::parse_device_message(&pending[consumed..]) {
+                                Ok(Some((message, used))) => {
+                                    consumed += used;
+                                    match message {
+                                        protocol::DeviceMessage::Ack { pts_ns } => {
+                                            let now = Instant::now();
+                                            *last_ack.lock().unwrap() = now;
+                                            if let Some(rtt) =
+                                                in_flight.lock().unwrap().ack(pts_ns, now)
+                                            {
+                                                round_trips.lock().unwrap().push(rtt);
+                                            }
+                                        }
+                                        protocol::DeviceMessage::Orientation { width, height } => {
+                                            *reported.lock().unwrap() = Some((width, height));
+                                        }
+                                        protocol::DeviceMessage::Touch(event) => {
+                                            if let Some(injector) = touch_in.as_mut() {
+                                                if let Err(e) = injector.inject(event) {
+                                                    tracing::warn!("touch injection failed: {e:#}");
+                                                    touch_in = None;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                protocol::DeviceMessage::Orientation { width, height } => {
-                                    *reported.lock().unwrap() = Some((width, height));
+                                Ok(None) => break,
+                                Err(e) => {
+                                    // No framing to resynchronise on.
+                                    tracing::warn!("device sent garbage, closing: {e:#}");
+                                    break 'read;
                                 }
                             }
                         }
+                        pending.drain(..consumed);
                     }
                     Err(e)
                         if matches!(

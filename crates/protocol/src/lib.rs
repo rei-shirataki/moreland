@@ -23,13 +23,19 @@
 //!     12   flags            u8   bit 0 = keyframe
 //!  13..16  reserved
 //!
-//! Device -> host, one of
-//!   Ack          8 bytes   pts of a rendered frame, u64
-//!   Orientation 16 bytes   0..8  u64::MAX (tag)
-//!                          8..10 width  u16   the device's current display size
-//!                         10..12 height u16
-//!                         12..16 reserved
 //! ```
+//!
+//! Device → host messages are each introduced by a one-byte tag:
+//!
+//! ```text
+//! ACK         (9 bytes)  tag 0x01, pts u64   a frame was rendered
+//! TOUCH       (7 bytes)  tag 0x02, action u8, slot u8, x u16, y u16
+//! ORIENTATION (5 bytes)  tag 0x03, width u16, height u16
+//!                        the device's current display size, e.g. after rotation
+//! ```
+//!
+//! Touch coordinates are normalised to `0..=TOUCH_EXTENT` across the whole
+//! streamed image, so the host needs no knowledge of the tablet's panel size.
 //!
 //! Every multi-byte field is **big-endian**. That is deliberate: Kotlin's
 //! `DataInputStream` reads big-endian natively, so the device side needs no
@@ -38,7 +44,7 @@
 use anyhow::{bail, Result};
 
 pub const MAGIC: [u8; 4] = *b"MRLD";
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const STREAM_HEADER_LEN: usize = 16;
 pub const FRAME_HEADER_LEN: usize = 16;
 
@@ -155,66 +161,139 @@ impl FrameHeader {
     }
 }
 
+/// Tag byte introducing each device → host message.
+pub const TAG_ACK: u8 = 0x01;
+pub const TAG_TOUCH: u8 = 0x02;
+pub const TAG_ORIENTATION: u8 = 0x03;
+
 /// Device → host acknowledgement, sent when a frame is handed to the display.
 ///
 /// This exists purely to make one-way latency measurable. Host and tablet have
 /// unrelated monotonic clocks, so timestamps cannot be compared directly; a
 /// round trip can be. The host measures send→ack and subtracts a baseline ping
 /// RTT to isolate transport plus decode.
-pub const ACK_LEN: usize = 8;
+pub const ACK_LEN: usize = 1 + 8;
 
-pub fn encode_ack(pts_ns: u64) -> [u8; ACK_LEN] {
-    pts_ns.to_be_bytes()
+/// Length of an ORIENTATION message including its tag.
+pub const ORIENTATION_LEN: usize = 1 + 2 + 2;
+
+/// Length of a TOUCH message including its tag.
+pub const TOUCH_LEN: usize = 1 + 1 + 1 + 2 + 2;
+
+/// Touch coordinates run `0..=TOUCH_EXTENT` across the streamed image.
+pub const TOUCH_EXTENT: u16 = u16::MAX;
+
+/// Simultaneous contacts carried. Slots at or above this are refused.
+pub const MAX_TOUCH_SLOTS: u8 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TouchAction {
+    Down = 0,
+    Move = 1,
+    /// Finger lifted, or the gesture was cancelled; the host treats both alike.
+    Up = 2,
 }
 
-pub fn decode_ack(buf: &[u8]) -> Result<u64> {
-    if buf.len() < ACK_LEN {
-        bail!("ack too short: {} bytes", buf.len());
+impl TouchAction {
+    pub fn from_u8(value: u8) -> Result<Self> {
+        Ok(match value {
+            0 => TouchAction::Down,
+            1 => TouchAction::Move,
+            2 => TouchAction::Up,
+            other => bail!("unknown touch action {other}"),
+        })
     }
-    Ok(u64::from_be_bytes(buf[..ACK_LEN].try_into().unwrap()))
 }
 
-/// First eight bytes of an [`DeviceMessage::Orientation`]; no real ack pts
-/// reaches it.
-pub const ORIENTATION_TAG: u64 = u64::MAX;
-pub const ORIENTATION_LEN: usize = 16;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TouchEvent {
+    pub action: TouchAction,
+    pub slot: u8,
+    pub x: u16,
+    pub y: u16,
+}
 
-/// Anything the device sends to the host.
+impl TouchEvent {
+    pub fn encode(&self) -> [u8; TOUCH_LEN] {
+        let mut buf = [0u8; TOUCH_LEN];
+        buf[0] = TAG_TOUCH;
+        buf[1] = self.action as u8;
+        buf[2] = self.slot;
+        buf[3..5].copy_from_slice(&self.x.to_be_bytes());
+        buf[5..7].copy_from_slice(&self.y.to_be_bytes());
+        buf
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceMessage {
-    Ack(u64),
+    Ack { pts_ns: u64 },
     /// The device's display changed size, usually because it was rotated.
     Orientation { width: u16, height: u16 },
+    Touch(TouchEvent),
 }
 
 pub fn encode_orientation(width: u16, height: u16) -> [u8; ORIENTATION_LEN] {
     let mut buf = [0u8; ORIENTATION_LEN];
-    buf[0..8].copy_from_slice(&ORIENTATION_TAG.to_be_bytes());
-    buf[8..10].copy_from_slice(&width.to_be_bytes());
-    buf[10..12].copy_from_slice(&height.to_be_bytes());
+    buf[0] = TAG_ORIENTATION;
+    buf[1..3].copy_from_slice(&width.to_be_bytes());
+    buf[3..5].copy_from_slice(&height.to_be_bytes());
     buf
 }
 
-/// Decode one message from the front of `buf`, returning it and the bytes it
-/// used, or `None` when `buf` does not yet hold a whole message.
-pub fn decode_device_message(buf: &[u8]) -> Option<(DeviceMessage, usize)> {
-    if buf.len() < ACK_LEN {
-        return None;
+pub fn encode_ack(pts_ns: u64) -> [u8; ACK_LEN] {
+    let mut buf = [0u8; ACK_LEN];
+    buf[0] = TAG_ACK;
+    buf[1..].copy_from_slice(&pts_ns.to_be_bytes());
+    buf
+}
+
+/// Parse one device → host message from the front of `buf`.
+///
+/// Returns `Ok(None)` when `buf` holds only part of a message, so the caller
+/// can read more and retry, and otherwise the message with the number of bytes
+/// it occupied. An unknown tag is an error: the stream has no framing to
+/// resynchronise on, so the connection cannot be trusted past it.
+pub fn parse_device_message(buf: &[u8]) -> Result<Option<(DeviceMessage, usize)>> {
+    let Some(&tag) = buf.first() else {
+        return Ok(None);
+    };
+    match tag {
+        TAG_ACK => {
+            if buf.len() < ACK_LEN {
+                return Ok(None);
+            }
+            let pts_ns = u64::from_be_bytes(buf[1..ACK_LEN].try_into().unwrap());
+            Ok(Some((DeviceMessage::Ack { pts_ns }, ACK_LEN)))
+        }
+        TAG_ORIENTATION => {
+            if buf.len() < ORIENTATION_LEN {
+                return Ok(None);
+            }
+            let message = DeviceMessage::Orientation {
+                width: u16::from_be_bytes([buf[1], buf[2]]),
+                height: u16::from_be_bytes([buf[3], buf[4]]),
+            };
+            Ok(Some((message, ORIENTATION_LEN)))
+        }
+        TAG_TOUCH => {
+            if buf.len() < TOUCH_LEN {
+                return Ok(None);
+            }
+            let event = TouchEvent {
+                action: TouchAction::from_u8(buf[1])?,
+                slot: buf[2],
+                x: u16::from_be_bytes([buf[3], buf[4]]),
+                y: u16::from_be_bytes([buf[5], buf[6]]),
+            };
+            if event.slot >= MAX_TOUCH_SLOTS {
+                bail!("touch slot {} out of range", event.slot);
+            }
+            Ok(Some((DeviceMessage::Touch(event), TOUCH_LEN)))
+        }
+        other => bail!("unknown device message tag 0x{other:02x}"),
     }
-    let first = u64::from_be_bytes(buf[..ACK_LEN].try_into().unwrap());
-    if first != ORIENTATION_TAG {
-        return Some((DeviceMessage::Ack(first), ACK_LEN));
-    }
-    if buf.len() < ORIENTATION_LEN {
-        return None;
-    }
-    Some((
-        DeviceMessage::Orientation {
-            width: u16::from_be_bytes([buf[8], buf[9]]),
-            height: u16::from_be_bytes([buf[10], buf[11]]),
-        },
-        ORIENTATION_LEN,
-    ))
 }
 
 #[cfg(test)]
@@ -263,28 +342,80 @@ mod tests {
     }
 
     #[test]
-    fn device_messages_decode_incrementally() {
+    fn ack_round_trips() {
+        let buf = encode_ack(1_666_666_600);
+        assert_eq!(
+            parse_device_message(&buf).unwrap(),
+            Some((DeviceMessage::Ack { pts_ns: 1_666_666_600 }, ACK_LEN))
+        );
+    }
+
+    #[test]
+    fn touch_round_trips() {
+        let event = TouchEvent {
+            action: TouchAction::Move,
+            slot: 3,
+            x: 12345,
+            y: 65535,
+        };
+        assert_eq!(
+            parse_device_message(&event.encode()).unwrap(),
+            Some((DeviceMessage::Touch(event), TOUCH_LEN))
+        );
+    }
+
+    #[test]
+    fn partial_messages_ask_for_more() {
+        let buf = encode_ack(7);
+        for cut in 0..ACK_LEN {
+            assert_eq!(parse_device_message(&buf[..cut]).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_tags_actions_and_slots() {
+        assert!(parse_device_message(&[0xff]).is_err());
+        let mut touch = TouchEvent {
+            action: TouchAction::Down,
+            slot: 0,
+            x: 0,
+            y: 0,
+        }
+        .encode();
+        touch[1] = 9;
+        assert!(parse_device_message(&touch).is_err());
+        touch[1] = 0;
+        touch[2] = MAX_TOUCH_SLOTS;
+        assert!(parse_device_message(&touch).is_err());
+    }
+
+    #[test]
+    fn messages_decode_incrementally_across_kinds() {
+        let touch = TouchEvent {
+            action: TouchAction::Down,
+            slot: 1,
+            x: 10,
+            y: 20,
+        };
         let mut wire = Vec::new();
         wire.extend_from_slice(&encode_ack(42));
         wire.extend_from_slice(&encode_orientation(1200, 1920));
+        wire.extend_from_slice(&touch.encode());
         wire.extend_from_slice(&encode_ack(43));
-
-        // A message cut short is not yet decodable.
-        assert_eq!(decode_device_message(&wire[..7]), None);
-        assert_eq!(decode_device_message(&wire[8..8 + 15]), None);
 
         let mut rest = &wire[..];
         let mut got = Vec::new();
-        while let Some((message, used)) = decode_device_message(rest) {
+        while let Some((message, used)) = parse_device_message(rest).unwrap() {
             got.push(message);
             rest = &rest[used..];
         }
         assert_eq!(
             got,
             [
-                DeviceMessage::Ack(42),
+                DeviceMessage::Ack { pts_ns: 42 },
                 DeviceMessage::Orientation { width: 1200, height: 1920 },
-                DeviceMessage::Ack(43),
+                DeviceMessage::Touch(touch),
+                DeviceMessage::Ack { pts_ns: 43 },
             ]
         );
         assert!(rest.is_empty());
