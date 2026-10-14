@@ -41,8 +41,14 @@ fn parse_args() -> Args {
             "--height" => height = Some(next_u32(1200)),
             "--max-width" => config.max_width = next_u32(1920),
             "--native" => config.max_width = u32::MAX,
-            "--fps" => config.fps = next_u32(60),
-            "--bitrate" => config.bitrate_kbps = next_u32(20_000),
+            "--fps" => {
+                config.fps = next_u32(60);
+                config.fps_explicit = true;
+            }
+            "--bitrate" => {
+                config.bitrate_kbps = next_u32(20_000);
+                config.bitrate_explicit = true;
+            }
             "--position" => {
                 config.position_x = it
                     .next()

@@ -26,6 +26,10 @@ pub struct Config {
     pub max_width: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// Set when the user passed `--fps` / `--bitrate`; device tuning never
+    /// overrides an explicit choice.
+    pub fps_explicit: bool,
+    pub bitrate_explicit: bool,
     pub position_x: i32,
     pub position_y: i32,
     pub output_name: String,
@@ -48,6 +52,8 @@ impl Default for Config {
             // saturates: 163 of 1764 frames unacked and a 208 ms stall.
             fps: 90,
             bitrate_kbps: 20_000,
+            fps_explicit: false,
+            bitrate_explicit: false,
             // Below a primary at 0x0, starting at y = 1080. This assumes the
             // primary is no taller than 1080px — on a taller display the
             // virtual output would overlap it rather than sit below. Override
@@ -62,6 +68,33 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Apply per-device defaults for hardware known to need them.
+    ///
+    /// The 90 fps default was measured on a Qualcomm tablet. HiSilicon
+    /// Kirin 659 (`hi6250`) decodes through an IMG MSVDX block that rejects
+    /// `KEY_LOW_LATENCY` and is built for 1080p-class streams, so 1920x1200 at
+    /// 90 fps backs up its input queue and latency climbs instead of falling.
+    fn tuned_for(&self, serial: &str) -> Config {
+        let mut tuned = self.clone();
+        let platform = adb::shell(serial, "getprop ro.board.platform").unwrap_or_default();
+        if platform.trim() == "hi6250" {
+            if !tuned.fps_explicit {
+                tuned.fps = 60;
+            }
+            if !tuned.bitrate_explicit {
+                tuned.bitrate_kbps = 12_000;
+            }
+            tracing::info!(
+                "device profile hi6250 (Kirin 659): {} fps, {} kbps",
+                tuned.fps,
+                tuned.bitrate_kbps
+            );
+        }
+        tuned
+    }
+}
+
 pub fn app_installed(serial: &str) -> Result<bool> {
     let out = adb::shell(serial, &format!("pm list packages {APP_PACKAGE}"))?;
     Ok(out.contains(APP_PACKAGE))
@@ -72,6 +105,7 @@ pub fn app_installed(serial: &str) -> Result<bool> {
 /// Every resource here is RAII-scoped: the virtual output and the adb forward
 /// are removed when this function returns, however it returns.
 pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
+    let config = &config.tuned_for(serial);
     if !app_installed(serial)? {
         bail!(
             "app not installed on the tablet.\n\
@@ -158,6 +192,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
             mode: BufferMode::Dmabuf,
             pool_size: 3,
             allowed_modifiers,
+            allowed_formats: encoder::supported_dmabuf_formats(),
             paint_cursor: config.paint_cursor,
         },
     )?;
@@ -213,49 +248,54 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         })
     };
 
-    let (packet_tx, packet_rx) = std::sync::mpsc::channel::<(Vec<u8>, u64, bool)>();
+    // The drain thread owns the sender: an encoded packet goes out the moment
+    // it exists. Sending from the capture loop instead held every packet until
+    // the *next* capture returned, which on a static screen is an arbitrarily
+    // long wait and on a busy one is up to a full frame of added latency.
     let drain_thread = {
         let encoder = Arc::clone(&encoder);
         let running = Arc::clone(&running);
-        std::thread::spawn(move || {
+        let sent_at = Arc::clone(&sent_at);
+        std::thread::spawn(move || -> (Sender, Result<()>) {
             while running.load(Ordering::Relaxed) {
                 match encoder.pull_packet(Duration::from_millis(100)) {
                     Ok(Some(p)) => {
-                        if packet_tx.send((p.data, p.pts_ns, p.keyframe)).is_err() {
-                            break;
+                        sent_at.lock().unwrap().push_back(Instant::now());
+                        if let Err(e) = sender.send_frame(&p.data, p.pts_ns, p.keyframe) {
+                            running.store(false, Ordering::Relaxed);
+                            return (sender, Err(e.into()));
                         }
                     }
                     Ok(None) => continue,
                     Err(e) => {
                         tracing::error!("encoder: {e}");
-                        break;
+                        running.store(false, Ordering::Relaxed);
+                        return (sender, Err(e));
                     }
                 }
             }
+            (sender, Ok(()))
         })
     };
 
     let frame_duration_ns = 1_000_000_000u64 / u64::from(config.fps);
     let mut index = 0u64;
     let result = (|| -> Result<()> {
-        while !shutdown.load(Ordering::Relaxed) {
+        while !shutdown.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
             let timing = capture.capture_frame()?;
             let dmabuf = capture
                 .dmabuf(timing.buffer_index)
                 .context("capture produced no DMA-BUF")?;
             encoder.push_frame(dmabuf.planes[0].fd.as_fd(), dmabuf.planes[0].offset, dmabuf.planes[0].stride, index * frame_duration_ns)?;
             index += 1;
-
-            while let Ok((data, pts, keyframe)) = packet_rx.try_recv() {
-                sent_at.lock().unwrap().push_back(Instant::now());
-                sender.send_frame(&data, pts, keyframe)?;
-            }
         }
         Ok(())
     })();
 
     running.store(false, Ordering::Relaxed);
-    let _ = drain_thread.join();
+    let (sender, send_result) = drain_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("send thread panicked"))?;
     let _ = ack_thread.join();
 
     if config.stats {
@@ -268,7 +308,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
 
     drop(forward);
     drop(output);
-    result
+    result.and(send_result)
 }
 
 fn report(trips: &[Duration], frames: u64, bytes: u64) {
