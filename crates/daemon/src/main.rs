@@ -9,6 +9,7 @@
 //! Plug the tablet in and a virtual monitor appears; unplug it and the monitor
 //! disappears. No commands in between.
 
+mod inflight;
 mod output;
 mod session;
 mod tracker;
