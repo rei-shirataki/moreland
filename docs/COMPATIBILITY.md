@@ -239,8 +239,11 @@ Verified on Android 11 (API 30) against an Intel Iris Xe host on Hyprland.
 - The decoder is `OMX.IMG.MSVDX.Decoder.AVC`. It rejects `KEY_LOW_LATENCY`
   with `ERROR_UNSUPPORTED`, so the app falls back through its hint ladder and
   starts with realtime priority and operating rate only.
-- It decodes about **60 fps at 1920×1200** whatever rate is offered: 90 fps
-  delivered the same ~1135 frames in a 19 s animation and only added latency.
+- It delivers at most **60 fps**, whatever rate is offered, and the cause is
+  the panel, not the decoder: the display has a single 60 Hz mode and frames
+  are presented on vsync. Dropping the stream to 1920×1080, 1440×900 or
+  1280×800 delivered the same ~1140 frames in a 19 s animation, and 90 fps
+  only added latency.
 - Without a bound on frames in flight the host queues behind it. A full-screen
   animation measured a 285 ms median round trip (p95 550 ms) against 11 ms at
   best.
@@ -262,9 +265,11 @@ noted:
 | `--cavlc` | 1137 | 34.0 ms | 49.8 ms |
 | `--target-usage 1` | 1139 | 33.8 ms | 45.5 ms |
 
-Bitrate, entropy coding and `target-usage` do not move latency here; the
-decoder is limited by frame throughput, not by the bitstream. Occasional
-outliers of 100–300 ms remain at the start of motion.
+Bitrate, entropy coding, `target-usage` and stream resolution do not move
+latency here; the in-flight depth and the 60 Hz panel decide it. H.265 was
+considered and not adopted: the link is wired USB at ~7 Mbps, so compression
+is not the constraint. Occasional outliers of 100–300 ms remain at the start
+of motion.
 
 The default **1920×1200** is appropriate for a 16:10 display. For a 16:9
 tablet, prefer `--width 1920 --height 1080`; a mismatched aspect ratio may
