@@ -313,25 +313,33 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     let last_ack: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
     // The device's latest reported display size, until the loop acts on it.
     let reported: Arc<Mutex<Option<(u16, u16)>>> = Arc::new(Mutex::new(None));
+    // Set by the ack reader when the device can no longer be listened to, so
+    // the session ends instead of streaming on with acks and touch gone.
+    let device_closed = Arc::new(AtomicBool::new(false));
 
-    // Created after the output exists so the compositor can bind the device to
-    // it. Touch is optional: without /dev/uinput access the display still works.
+    // Bound before the device exists: Hyprland keys the rule on the name and
+    // applies it when the device appears, so there is no discovery to wait
+    // for. Touch is optional: without /dev/uinput access the display still
+    // works.
     let mut touch_in = if config.touch {
-        match TouchInjector::create() {
-            Ok(injector) => {
-                // Hyprland discovers the device asynchronously; give it a
-                // moment before naming it in a rule.
-                std::thread::sleep(Duration::from_millis(300));
-                if let Err(e) = output.bind_input_device(touch::DEVICE_NAME) {
-                    tracing::warn!(
-                        "touch is on, but could not be bound to {}: {e:#}\n\
-                         map {} to that output in your compositor config",
-                        output.name(),
-                        touch::DEVICE_NAME
-                    );
-                }
-                Some(injector)
+        if let Err(e) = output.bind_input_device(touch::DEVICE_NAME) {
+            // Said once per daemon: a compositor that cannot bind at runtime
+            // will refuse every session, and the user may already have
+            // mapped the device in its config.
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "touch is on, but could not be bound to {}: {e:#}\n\
+                     map {} to that output in your compositor config",
+                    output.name(),
+                    touch::DEVICE_NAME
+                );
+            } else {
+                tracing::debug!("touch not bound to {}: {e:#}", output.name());
             }
+        }
+        match TouchInjector::create() {
+            Ok(injector) => Some(injector),
             Err(e) => {
                 tracing::warn!("touch disabled: {e:#}");
                 None
@@ -347,12 +355,14 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         let in_flight = Arc::clone(&in_flight);
         let round_trips = Arc::clone(&round_trips);
         let alive = Arc::clone(&alive);
+        let device_closed = Arc::clone(&device_closed);
         let reported = Arc::clone(&reported);
         std::thread::spawn(move || {
             // Messages are small and fixed-length per tag; one can arrive
             // split across reads, so keep what has not parsed yet.
             let mut pending: Vec<u8> = Vec::with_capacity(256);
             let mut chunk = [0u8; 256];
+            let mut warned_unsupported = false;
             'read: while alive.load(Ordering::Relaxed) {
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
@@ -384,6 +394,16 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                                                 }
                                             }
                                         }
+                                        protocol::DeviceMessage::Unsupported => {
+                                            if !warned_unsupported {
+                                                tracing::warn!(
+                                                    "device sent a touch this daemon does not \
+                                                     understand; ignoring such touches — is \
+                                                     the app a different version?"
+                                                );
+                                                warned_unsupported = true;
+                                            }
+                                        }
                                     }
                                 }
                                 Ok(None) => break,
@@ -403,6 +423,12 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                         ) => {}
                     Err(_) => break,
                 }
+            }
+            // However the reader stopped, the session cannot go on without
+            // it. Shutting the socket also fails a send already under way.
+            if alive.load(Ordering::Relaxed) {
+                device_closed.store(true, Ordering::Relaxed);
+                let _ = reader.shutdown(std::net::Shutdown::Both);
             }
         })
     };
@@ -473,6 +499,9 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
 
         let exit = (|| -> Result<Exit> {
             while !shutdown.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
+                if device_closed.load(Ordering::Relaxed) {
+                    bail!("the device stopped talking to the daemon");
+                }
                 if let Some(target) = wanted_size(size) {
                     return Ok(Exit::Resize(target));
                 }

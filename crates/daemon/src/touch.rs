@@ -121,20 +121,58 @@ fn ioctl(file: &File, request: u64, arg: impl IoctlArg) -> std::io::Result<()> {
     }
 }
 
-/// `(type, code, value)` triples, ending in a SYN_REPORT.
-type Frame = Vec<(u16, u16, i32)>;
+/// Most events one `Contacts::apply` emits: slot, tracking id, two MT
+/// positions, two legacy positions, BTN_TOUCH and SYN_REPORT.
+const MAX_FRAME_EVENTS: usize = 8;
+
+/// `(type, code, value)` triples, ending in a SYN_REPORT. Fixed capacity, so
+/// replaying a touch allocates nothing on the thread that also times acks.
+#[derive(Default)]
+struct Frame {
+    events: [(u16, u16, i32); MAX_FRAME_EVENTS],
+    len: usize,
+}
+
+impl Frame {
+    fn push(&mut self, event: (u16, u16, i32)) {
+        self.events[self.len] = event;
+        self.len += 1;
+    }
+
+    fn events(&self) -> &[(u16, u16, i32)] {
+        &self.events[..self.len]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
 
 /// The protocol-B bookkeeping, separate from the file so it can be tested.
 #[derive(Default)]
 struct Contacts {
     active: [bool; MAX_TOUCH_SLOTS as usize],
+    /// When each live contact went down, to find the oldest.
+    started: [u64; MAX_TOUCH_SLOTS as usize],
+    position: [(u16, u16); MAX_TOUCH_SLOTS as usize],
+    downs: u64,
     current_slot: Option<u8>,
     next_tracking_id: i32,
+    /// What ABS_X/ABS_Y last said.
+    legacy: Option<(u16, u16)>,
 }
 
 impl Contacts {
     fn count(&self) -> usize {
         self.active.iter().filter(|a| **a).count()
+    }
+
+    /// The contact the single-touch axes follow: the oldest one still down,
+    /// as the kernel's own pointer emulation picks it.
+    fn primary(&self) -> Option<usize> {
+        (0..self.active.len())
+            .filter(|&slot| self.active[slot])
+            .min_by_key(|&slot| self.started[slot])
     }
 
     fn select(&mut self, slot: u8, frame: &mut Frame) {
@@ -145,17 +183,16 @@ impl Contacts {
     }
 
     fn apply(&mut self, event: TouchEvent) -> Frame {
-        let mut frame = Frame::new();
+        let mut frame = Frame::default();
         let slot = usize::from(event.slot);
         if slot >= self.active.len() {
             return frame;
         }
         let was_touching = self.count() > 0;
-        let position = |frame: &mut Frame| {
+        let position = |contacts: &mut Self, frame: &mut Frame| {
+            contacts.position[slot] = (event.x, event.y);
             frame.push((EV_ABS, ABS_MT_POSITION_X, i32::from(event.x)));
             frame.push((EV_ABS, ABS_MT_POSITION_Y, i32::from(event.y)));
-            frame.push((EV_ABS, ABS_X, i32::from(event.x)));
-            frame.push((EV_ABS, ABS_Y, i32::from(event.y)));
         };
 
         match event.action {
@@ -163,16 +200,18 @@ impl Contacts {
             TouchAction::Down if !self.active[slot] => {
                 self.select(event.slot, &mut frame);
                 self.active[slot] = true;
+                self.started[slot] = self.downs;
+                self.downs += 1;
                 frame.push((EV_ABS, ABS_MT_TRACKING_ID, self.next_tracking_id));
                 self.next_tracking_id = (self.next_tracking_id + 1) & 0xffff;
-                position(&mut frame);
+                position(self, &mut frame);
             }
             TouchAction::Down | TouchAction::Move => {
                 if !self.active[slot] {
                     return frame;
                 }
                 self.select(event.slot, &mut frame);
-                position(&mut frame);
+                position(self, &mut frame);
             }
             TouchAction::Up => {
                 if !self.active[slot] {
@@ -181,6 +220,17 @@ impl Contacts {
                 self.select(event.slot, &mut frame);
                 self.active[slot] = false;
                 frame.push((EV_ABS, ABS_MT_TRACKING_ID, -1));
+            }
+        }
+
+        // Only the primary contact drives the legacy axes; when it lifts,
+        // they move once to the contact that takes over.
+        if let Some(primary) = self.primary() {
+            let (x, y) = self.position[primary];
+            if self.legacy != Some((x, y)) {
+                frame.push((EV_ABS, ABS_X, i32::from(x)));
+                frame.push((EV_ABS, ABS_Y, i32::from(y)));
+                self.legacy = Some((x, y));
             }
         }
 
@@ -300,12 +350,12 @@ impl TouchInjector {
     }
 
     fn write(&mut self, frame: &Frame) -> Result<()> {
+        const SIZE: usize = std::mem::size_of::<InputEvent>();
         if frame.is_empty() {
             return Ok(());
         }
-        let size = std::mem::size_of::<InputEvent>();
-        let mut bytes = Vec::with_capacity(frame.len() * size);
-        for &(kind, code, value) in frame {
+        let mut buf = [0u8; MAX_FRAME_EVENTS * SIZE];
+        for (i, &(kind, code, value)) in frame.events().iter().enumerate() {
             let event = InputEvent {
                 time: libc::timeval {
                     tv_sec: 0,
@@ -317,12 +367,13 @@ impl TouchInjector {
             };
             // SAFETY: InputEvent is repr(C) plain data, and the kernel reads
             // exactly this layout from a uinput write.
-            bytes.extend_from_slice(unsafe {
-                std::slice::from_raw_parts((&event as *const InputEvent).cast::<u8>(), size)
+            buf[i * SIZE..(i + 1) * SIZE].copy_from_slice(unsafe {
+                std::slice::from_raw_parts((&event as *const InputEvent).cast::<u8>(), SIZE)
             });
         }
+        let bytes = &buf[..frame.len * SIZE];
         // One write per frame, so the kernel sees the events together.
-        match self.file.write(&bytes) {
+        match self.file.write(bytes) {
             Ok(n) if n == bytes.len() => Ok(()),
             Ok(n) => bail!("short uinput write: {n} of {} bytes", bytes.len()),
             Err(e) => Err(e).context("writing to uinput"),
@@ -346,7 +397,7 @@ mod tests {
     }
 
     fn has(frame: &Frame, kind: u16, code: u16, value: i32) -> bool {
-        frame.contains(&(kind, code, value))
+        frame.events().contains(&(kind, code, value))
     }
 
     #[test]
@@ -358,7 +409,7 @@ mod tests {
         assert!(has(&frame, EV_ABS, ABS_MT_POSITION_X, 100));
         assert!(has(&frame, EV_ABS, ABS_MT_POSITION_Y, 200));
         assert!(has(&frame, EV_KEY, BTN_TOUCH, 1));
-        assert_eq!(frame.last(), Some(&(EV_SYN, SYN_REPORT, 0)));
+        assert_eq!(frame.events().last(), Some(&(EV_SYN, SYN_REPORT, 0)));
     }
 
     #[test]
@@ -366,9 +417,9 @@ mod tests {
         let mut c = Contacts::default();
         c.apply(ev(TouchAction::Down, 0, 1, 1));
         let second = c.apply(ev(TouchAction::Down, 1, 2, 2));
-        assert!(!second.iter().any(|e| e.1 == BTN_TOUCH));
+        assert!(!second.events().iter().any(|e| e.1 == BTN_TOUCH));
         let up = c.apply(ev(TouchAction::Up, 0, 0, 0));
-        assert!(!up.iter().any(|e| e.1 == BTN_TOUCH));
+        assert!(!up.events().iter().any(|e| e.1 == BTN_TOUCH));
         let last = c.apply(ev(TouchAction::Up, 1, 0, 0));
         assert!(has(&last, EV_ABS, ABS_MT_TRACKING_ID, -1));
         assert!(has(&last, EV_KEY, BTN_TOUCH, 0));
@@ -379,7 +430,7 @@ mod tests {
         let mut c = Contacts::default();
         c.apply(ev(TouchAction::Down, 2, 1, 1));
         let moved = c.apply(ev(TouchAction::Move, 2, 5, 5));
-        assert!(!moved.iter().any(|e| e.1 == ABS_MT_SLOT));
+        assert!(!moved.events().iter().any(|e| e.1 == ABS_MT_SLOT));
         c.apply(ev(TouchAction::Down, 3, 1, 1));
         let back = c.apply(ev(TouchAction::Move, 2, 6, 6));
         assert!(has(&back, EV_ABS, ABS_MT_SLOT, 2));
@@ -405,6 +456,32 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         injector.inject(ev(TouchAction::Up, 0, 0, 0)).unwrap();
+    }
+
+    #[test]
+    fn legacy_axes_follow_the_oldest_contact() {
+        let mut c = Contacts::default();
+        let first = c.apply(ev(TouchAction::Down, 0, 10, 10));
+        assert!(has(&first, EV_ABS, ABS_X, 10));
+        let second = c.apply(ev(TouchAction::Down, 1, 90, 90));
+        assert!(!second
+            .events()
+            .iter()
+            .any(|e| e.0 == EV_ABS && (e.1 == ABS_X || e.1 == ABS_Y)));
+        let other = c.apply(ev(TouchAction::Move, 1, 80, 80));
+        assert!(!other
+            .events()
+            .iter()
+            .any(|e| e.0 == EV_ABS && (e.1 == ABS_X || e.1 == ABS_Y)));
+        let primary = c.apply(ev(TouchAction::Move, 0, 20, 20));
+        assert!(has(&primary, EV_ABS, ABS_X, 20));
+        assert!(has(&primary, EV_ABS, ABS_Y, 20));
+        // The first finger lifts: the axes hand over to the second, once.
+        let lift = c.apply(ev(TouchAction::Up, 0, 0, 0));
+        assert!(has(&lift, EV_ABS, ABS_X, 80));
+        assert!(has(&lift, EV_ABS, ABS_Y, 80));
+        let next = c.apply(ev(TouchAction::Move, 1, 70, 70));
+        assert!(has(&next, EV_ABS, ABS_X, 70));
     }
 
     #[test]
