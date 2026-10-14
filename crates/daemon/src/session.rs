@@ -290,7 +290,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
 
     let mut sender = Sender::connect(
         port,
-        &stream_header(capture.width, capture.height, config.fps),
+        &stream_header(capture.width, capture.height, config.fps)?,
     )
     .context("connecting to the app — is it in the foreground on the tablet?")?;
     tracing::info!("streaming to {serial}");

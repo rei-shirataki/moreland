@@ -111,6 +111,12 @@ impl StreamHeader {
 
 pub const FLAG_KEYFRAME: u8 = 1 << 0;
 
+/// Largest frame payload the device accepts; it drops the connection on
+/// anything bigger rather than attempt the allocation. Mirrors
+/// `Protocol.MAX_FRAME_BYTES` in the Android app, so the host can refuse to
+/// send one instead of having the session die on the far side.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct FrameHeader {
     pub length: u32,
