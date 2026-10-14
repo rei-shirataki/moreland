@@ -33,7 +33,8 @@ pub const VERSION: u16 = 1;
 pub const STREAM_HEADER_LEN: usize = 16;
 pub const FRAME_HEADER_LEN: usize = 16;
 
-/// Default host-side port for `adb forward`.
+/// Host-side port for `adb forward` in the probes. The daemon lets adb pick a
+/// free port per session instead.
 pub const DEFAULT_PORT: u16 = 27183;
 /// Abstract Unix socket the device app listens on when launched by hand.
 ///

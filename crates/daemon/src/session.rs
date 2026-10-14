@@ -206,11 +206,8 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     // Android, so with a fixed one any app on the tablet could bind it while
     // ours is force-stopped below and receive the desktop stream instead.
     let socket = session_socket_name()?;
-    let forward = adb::Forward::new(
-        serial,
-        protocol::DEFAULT_PORT,
-        &format!("localabstract:{socket}"),
-    )?;
+    // Port 0: adb picks a free one, so two devices or daemons never collide.
+    let forward = adb::Forward::new(serial, 0, &format!("localabstract:{socket}"))?;
     let port = forward.local_port()?;
 
     // The abstract socket name is process-wide on Android, so a stale instance

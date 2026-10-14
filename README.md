@@ -315,11 +315,10 @@ Read before publishing or installing.
 **No network exposure.** `adb forward` binds `127.0.0.1` only. Nothing listens
 on an external interface, and no traffic leaves the machine or the USB cable.
 
-**The trust boundary is your local machine and your tablet.** Two consequences
-on a shared or multi-user system:
-
-- Any local process able to reach `127.0.0.1:27183` can push frames to the
-  tablet while the daemon is running.
+**The trust boundary is your local machine and your tablet.** On a shared or
+multi-user system, any local process able to reach the forwarded `127.0.0.1`
+port (chosen by adb per session; `adb forward --list` shows it) can push
+frames to the tablet while the daemon is running.
 
 On the tablet, abstract Unix sockets carry no filesystem permissions, so the
 app does its own checks: it accepts connections only from adbd (the `shell` or
