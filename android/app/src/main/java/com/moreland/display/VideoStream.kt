@@ -181,54 +181,92 @@ class VideoStream {
         }
     }
 
+    /**
+     * Low-latency hints, most to least aggressive. Some decoders reject a
+     * format outright (`Error 0xfffffc0e`, ERROR_UNSUPPORTED) when a hint they
+     * do not implement is present, so each attempt drops one and the first that
+     * configures wins. A stream with no hints is slower but still correct.
+     */
+    private enum class Hints { LOW_LATENCY_AND_VENDOR, REALTIME_ONLY, NONE }
+
     private fun configureCodec(header: Protocol.StreamHeader, target: Surface): MediaCodec {
+        var failure: Exception? = null
+        for (hints in Hints.values()) {
+            try {
+                return configureCodec(header, target, hints)
+            } catch (e: Exception) {
+                Log.w(TAG, "decoder config with $hints failed: ${e.message}")
+                failure = e
+            }
+        }
+        throw failure ?: IOException("no decoder configuration succeeded")
+    }
+
+    private fun configureCodec(
+        header: Protocol.StreamHeader,
+        target: Surface,
+        hints: Hints,
+    ): MediaCodec {
         val format = MediaFormat.createVideoFormat(header.mime, header.width, header.height)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        if (hints == Hints.LOW_LATENCY_AND_VENDOR && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        }
+        if (hints != Hints.NONE) {
+            // Realtime priority and an operating rate let decoders without a
+            // low-latency mode (e.g. OMX.IMG.MSVDX, which rejects
+            // KEY_LOW_LATENCY) stop scheduling for throughput over latency.
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+            format.setInteger(MediaFormat.KEY_OPERATING_RATE, header.framerate)
         }
         // This device exposes OMX.qcom decoders and declares no `low-latency`
         // feature, so KEY_LOW_LATENCY may be ignored. The Qualcomm vendor
-        // extension is the fallback; unknown vendor keys are ignored rather
-        // than rejected, so setting it costs nothing.
-        runCatching { format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1) }
+        // extension is the fallback.
+        if (hints == Hints.LOW_LATENCY_AND_VENDOR) {
+            runCatching { format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1) }
+        }
 
         val codec = MediaCodec.createDecoderByType(header.mime)
-        codec.setCallback(object : MediaCodec.Callback() {
-            override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-                freeInputs.offer(index)
-            }
-
-            override fun onOutputBufferAvailable(
-                codec: MediaCodec,
-                index: Int,
-                info: MediaCodec.BufferInfo,
-            ) {
-                // Render only while a surface is attached; otherwise release
-                // without rendering so the buffer is recycled rather than the
-                // session failing. Render first, account after; the
-                // acknowledgement is queued so this callback never blocks.
-                val render = surface?.isValid == true
-                runCatching { codec.releaseOutputBuffer(index, render) }
-                if (render) {
-                    framesDecoded++
-                    pendingAcks.offer(info.presentationTimeUs * 1000)
+        try {
+            codec.setCallback(object : MediaCodec.Callback() {
+                override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
+                    freeInputs.offer(index)
                 }
-            }
 
-            override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
-                lastError = e.message
-                Log.e(TAG, "codec error: ${e.message}", e)
-            }
+                override fun onOutputBufferAvailable(
+                    codec: MediaCodec,
+                    index: Int,
+                    info: MediaCodec.BufferInfo,
+                ) {
+                    // Render only while a surface is attached; otherwise release
+                    // without rendering so the buffer is recycled rather than the
+                    // session failing. Render first, account after; the
+                    // acknowledgement is queued so this callback never blocks.
+                    val render = surface?.isValid == true
+                    runCatching { codec.releaseOutputBuffer(index, render) }
+                    if (render) {
+                        framesDecoded++
+                        pendingAcks.offer(info.presentationTimeUs * 1000)
+                    }
+                }
 
-            override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
-                Log.i(TAG, "output format: $format")
-            }
-        })
+                override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
+                    lastError = e.message
+                    Log.e(TAG, "codec error: ${e.message}", e)
+                }
 
-        codec.configure(format, target, null, 0)
-        codec.start()
-        Log.i(TAG, "decoder started: ${codec.name}")
+                override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+                    Log.i(TAG, "output format: $format")
+                }
+            })
+
+            codec.configure(format, target, null, 0)
+            codec.start()
+        } catch (e: Exception) {
+            runCatching { codec.release() }
+            throw e
+        }
+        Log.i(TAG, "decoder started: ${codec.name} ($hints)")
         return codec
     }
 
