@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracker::DeviceTracker;
 
-/// Exit statuses that restarting cannot fix. The systemd unit lists both in
+/// Exit statuses that restarting cannot fix. The systemd unit lists all of them in
 /// `RestartPreventExitStatus=`, so it gives up instead of relaunching every
 /// `RestartSec` for as long as the session lasts.
 const EXIT_USAGE: i32 = 2;
