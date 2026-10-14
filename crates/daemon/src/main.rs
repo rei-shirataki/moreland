@@ -223,14 +223,13 @@ fn main() -> Result<()> {
     while !shutdown.load(Ordering::Relaxed) {
         // Short timeout: absence of an update is normal and just means the
         // list still stands.
-        tracker.set_timeout(Some(Duration::from_millis(500)))?;
-        match tracker.next_update() {
-            Ok(update) => {
+        match tracker.next_update(Duration::from_millis(500)) {
+            Ok(Some(update)) => {
                 devices = update;
                 announced_idle = false;
                 consecutive_failures = 0;
             }
-            Err(e) if is_timeout(&e) => {}
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!("device tracker lost: {e}; reconnecting");
                 devices.clear();
@@ -294,17 +293,6 @@ fn main() -> Result<()> {
 
     tracing::info!("shutting down");
     Ok(())
-}
-
-fn is_timeout(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
-            matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            )
-        })
-    })
 }
 
 #[cfg(test)]
