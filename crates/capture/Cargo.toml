@@ -2,12 +2,13 @@
 name = "capture"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
-# used by session.rs for renegotiation logging
+# used by bin/screencopy_probe.rs
 tracing-subscriber.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true

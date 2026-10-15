@@ -228,9 +228,14 @@ impl TouchEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceMessage {
-    Ack { pts_ns: u64 },
+    Ack {
+        pts_ns: u64,
+    },
     /// The device's display changed size, usually because it was rotated.
-    Orientation { width: u16, height: u16 },
+    Orientation {
+        width: u16,
+        height: u16,
+    },
     Touch(TouchEvent),
 }
 
@@ -346,7 +351,12 @@ mod tests {
         let buf = encode_ack(1_666_666_600);
         assert_eq!(
             parse_device_message(&buf).unwrap(),
-            Some((DeviceMessage::Ack { pts_ns: 1_666_666_600 }, ACK_LEN))
+            Some((
+                DeviceMessage::Ack {
+                    pts_ns: 1_666_666_600
+                },
+                ACK_LEN
+            ))
         );
     }
 
@@ -413,7 +423,10 @@ mod tests {
             got,
             [
                 DeviceMessage::Ack { pts_ns: 42 },
-                DeviceMessage::Orientation { width: 1200, height: 1920 },
+                DeviceMessage::Orientation {
+                    width: 1200,
+                    height: 1920
+                },
                 DeviceMessage::Touch(touch),
                 DeviceMessage::Ack { pts_ns: 43 },
             ]

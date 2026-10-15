@@ -216,7 +216,7 @@ info ""
 info "Requirements, whatever the distro:"
 info "  • Hyprland (any recent release) or another compositor implementing"
 info "    ext-image-copy-capture-v1 — wlroots 0.18+ compositors do"
-info "  • GStreamer 1.22+ for the va plugin (vapostproc, vah264enc);"
+info "  • GStreamer 1.24+ for the va plugin and build feature bindings (vapostproc, vah264enc);"
 info "    developed against 1.28"
 info "  • Mesa with radeonsi/iHD VA-API, or nvidia-vaapi-driver"
 
@@ -238,10 +238,12 @@ case "$DISTRO_ID $DISTRO_LIKE" in
     *debian*|*ubuntu*)
         info ""
         info "Install (UNVERIFIED — package names are best-effort):"
-        info "  sudo apt install rustc cargo gstreamer1.0-plugins-base \\"
+        info "  sudo apt install gstreamer1.0-plugins-base \\"
         info "      gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \\"
         info "      libva2 vainfo adb wayland-utils"
-        info "  Check GStreamer is 1.22+; older stable releases lack the va plugin."
+        info "  The packaged rustc is older than the 1.92 this needs; install Rust"
+        info "  with rustup (https://rustup.rs) instead of apt."
+        info "  Check GStreamer is 1.24+; older stable releases (like Debian 12) lack required 1.24+ bindings."
         ;;
     *suse*)
         info ""

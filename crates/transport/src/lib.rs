@@ -3,6 +3,7 @@
 //! Framed video transport to the device over `adb forward`.
 
 pub mod adb;
+pub mod process;
 
 use anyhow::{bail, Context, Result};
 use protocol::{Codec, FrameHeader, StreamHeader};

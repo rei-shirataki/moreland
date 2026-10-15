@@ -202,8 +202,10 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
             Event::DmabufFormat { format, modifiers } => {
                 state.begin_generation();
                 let modifiers = modifiers
-                    .chunks_exact(8)
-                    .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| u64::from_ne_bytes(*c))
                     .collect();
                 state.caps.dmabuf_formats.push((format, modifiers));
             }
@@ -287,6 +289,8 @@ enum CaptureError {
     /// The pool no longer matches the session; re-allocate and retry.
     BufferConstraints,
     Stopped,
+    /// The caller asked to stop waiting; not a capture failure.
+    Interrupted,
     Other(anyhow::Error),
 }
 
@@ -299,10 +303,14 @@ impl From<CaptureError> for anyhow::Error {
             CaptureError::Stopped => {
                 anyhow::anyhow!("capture session was stopped by the compositor")
             }
+            CaptureError::Interrupted => anyhow::anyhow!("capture was interrupted"),
             CaptureError::Other(e) => e,
         }
     }
 }
+
+/// How often a blocked capture checks whether its caller wants it to stop.
+pub const STOP_POLL: Duration = Duration::from_millis(200);
 
 /// A live capture session bound to one output.
 pub struct Capture {
@@ -370,7 +378,10 @@ impl Capture {
             .map(|o| o.proxy.clone())
             .with_context(|| {
                 let known: Vec<&str> = state.outputs.iter().map(|o| o.name.as_str()).collect();
-                format!("no output named {output_name:?} (have: {})", known.join(", "))
+                format!(
+                    "no output named {output_name:?} (have: {})",
+                    known.join(", ")
+                )
             })?;
 
         let source_manager: ExtOutputImageCaptureSourceManagerV1 = globals
@@ -609,22 +620,41 @@ impl Capture {
     /// claiming the output, a mode change, a scanout path switch. The protocol
     /// specifies re-allocating and retrying, so that is not an error path.
     pub fn capture_frame(&mut self) -> Result<FrameTiming> {
-        match self.try_capture_frame() {
+        self.capture_frame_until(|| false)?
+            .context("capture was interrupted")
+    }
+
+    /// Like [`capture_frame`](Self::capture_frame), but gives up and returns
+    /// `None` once `stop` returns true. A static screen produces no damage and
+    /// so no frame, so without this a shutdown request would wait forever.
+    /// `stop` is polled every [`STOP_POLL`].
+    pub fn capture_frame_until(&mut self, stop: impl Fn() -> bool) -> Result<Option<FrameTiming>> {
+        let result = match self.try_capture_frame(&stop) {
             Err(CaptureError::BufferConstraints) => {
                 tracing::info!("buffer constraints changed; re-allocating capture pool");
                 self.renegotiate()?;
-                self.try_capture_frame().map_err(Into::into)
+                self.try_capture_frame(&stop)
             }
-            other => other.map_err(Into::into),
+            other => other,
+        };
+        match result {
+            Ok(timing) => Ok(Some(timing)),
+            Err(CaptureError::Interrupted) => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
-    fn try_capture_frame(&mut self) -> std::result::Result<FrameTiming, CaptureError> {
+    fn try_capture_frame(
+        &mut self,
+        stop: &dyn Fn() -> bool,
+    ) -> std::result::Result<FrameTiming, CaptureError> {
         if self.state.session_stopped {
             return Err(CaptureError::Stopped);
         }
         if self.buffers.is_empty() {
-            return Err(CaptureError::Other(anyhow::anyhow!("capture pool is empty")));
+            return Err(CaptureError::Other(anyhow::anyhow!(
+                "capture pool is empty"
+            )));
         }
 
         let index = self.next_buffer;
@@ -645,9 +675,17 @@ impl Capture {
             && self.state.frame_failed.is_none()
             && self.state.frame_failed_raw.is_none()
         {
-            self.queue
-                .blocking_dispatch(&mut self.state)
-                .map_err(|e| CaptureError::Other(e.into()))?;
+            if self.state.session_stopped {
+                frame.destroy();
+                return Err(CaptureError::Stopped);
+            }
+            if stop() {
+                frame.destroy();
+                return Err(CaptureError::Interrupted);
+            }
+            let step_deadline = Instant::now() + STOP_POLL;
+            dispatch_until(&mut self.queue, &mut self.state, step_deadline)
+                .map_err(CaptureError::Other)?;
         }
         let latency = started.elapsed();
         let received_ns = monotonic_ns();

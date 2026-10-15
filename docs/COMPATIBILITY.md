@@ -285,7 +285,7 @@ mainstream distro can supply all three:
 | Requirement | Minimum | Why |
 |---|---|---|
 | A compositor implementing `ext-image-copy-capture-v1` | Hyprland, or wlroots 0.18+ | Capture has nothing to bind to otherwise |
-| GStreamer with the `va` plugin | 1.22+ (developed against 1.28) | `vapostproc` and `vah264enc` |
+| GStreamer with the `va` plugin | 1.24+ (build requires GStreamer 1.24+ bindings; developed against 1.28) | `vapostproc` and `vah264enc` |
 | A VA-API driver | Mesa `radeonsi`/`iHD`, or `nvidia-vaapi-driver` | Hardware H.264 encode |
 
 A distro influences the outcome only indirectly, in two ways: **which desktop
@@ -294,9 +294,9 @@ work?" is not really a question about Fedora — Fedora Workstation ships GNOME
 and is blocked for the same reason Plasma is, while Fedora with Hyprland
 installed should work. The same holds for Ubuntu, Debian and openSUSE.
 
-The one genuine distro-level trap is GStreamer age: the `va` plugin element set
-only became usable around 1.22, so a conservative stable release (Debian
-oldstable, older Ubuntu LTS, RHEL) can fail on that alone even under Hyprland.
+The one genuine distro-level trap is GStreamer age: the build requires GStreamer 1.24+
+(due to the `v1_24` feature requirement in `gstreamer-video`), so a conservative stable release (Debian 12
+bookworm which ships 1.22, older Ubuntu LTS, RHEL) will fail to build or run on that alone even under Hyprland.
 
 Package names, since those *are* distro-specific — only the Arch line is
 verified, the rest are best-effort and untested:
@@ -312,8 +312,9 @@ sudo dnf install rust cargo gstreamer1-plugins-base gstreamer1-plugins-good \
                  gstreamer1-plugins-bad-free libva libva-utils android-tools \
                  wayland-utils
 
-# Debian / Ubuntu — UNVERIFIED, check GStreamer is 1.22+
-sudo apt install rustc cargo gstreamer1.0-plugins-base \
+# Debian / Ubuntu — UNVERIFIED, check GStreamer is 1.22+. The packaged rustc
+# is older than the Rust 1.92 this needs, so install Rust with rustup.
+sudo apt install gstreamer1.0-plugins-base \
                  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
                  libva2 vainfo adb wayland-utils
 ```

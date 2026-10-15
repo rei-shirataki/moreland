@@ -2,6 +2,7 @@
 
 //! Thin wrapper over the `adb` CLI.
 
+use crate::process::run_with_timeout;
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 
@@ -11,9 +12,9 @@ fn adb_binary() -> String {
 }
 
 fn adb(args: &[&str]) -> Result<String> {
-    let output = Command::new(adb_binary())
-        .args(args)
-        .output()
+    let mut cmd = Command::new(adb_binary());
+    cmd.args(args);
+    let output = run_with_timeout(&mut cmd, std::time::Duration::from_secs(10))
         .with_context(|| format!("running `adb {}`", args.join(" ")))?;
     if !output.status.success() {
         bail!(
@@ -128,13 +129,7 @@ pub fn shell(serial: &str, command: &str) -> Result<String> {
 /// `wm size` reports the panel as the hardware sees it, which on a tablet is
 /// portrait (e.g. `1800x2880`). The virtual output is landscape, so the axes
 /// are swapped here rather than at every call site.
-pub fn display_size(serial: &str) -> Result<(u32, u32)> {
-    let out = shell(serial, "wm size").context("querying device display size")?;
-
-    // Output is one or two lines:
-    //   Physical size: 1800x2880
-    //   Override size: 1440x2304      (present only when a size override is set)
-    // The override is what apps actually get, so prefer it when present.
+pub fn parse_wm_size(out: &str) -> Result<(u32, u32)> {
     let parse = |prefix: &str| -> Option<(u32, u32)> {
         let line = out.lines().find(|l| l.trim().starts_with(prefix))?;
         let spec = line.split(':').nth(1)?.trim();
@@ -150,6 +145,11 @@ pub fn display_size(serial: &str) -> Result<(u32, u32)> {
         bail!("device reported a zero display dimension: {w}x{h}");
     }
     Ok(if w >= h { (w, h) } else { (h, w) })
+}
+
+pub fn display_size(serial: &str) -> Result<(u32, u32)> {
+    let out = shell(serial, "wm size").context("querying device display size")?;
+    parse_wm_size(&out)
 }
 
 /// Pick a streaming resolution matching the device's aspect ratio.
@@ -243,5 +243,19 @@ mod tests {
                 "aspect drift for {panel:?}: wanted {want:.4}, got {got:.4}"
             );
         }
+    }
+
+    #[test]
+    fn parses_wm_size_physical_and_override() {
+        assert_eq!(
+            parse_wm_size("Physical size: 1800x2880\n").unwrap(),
+            (2880, 1800)
+        );
+        assert_eq!(
+            parse_wm_size("Physical size: 1800x2880\nOverride size: 1440x2304\n").unwrap(),
+            (2304, 1440)
+        );
+        assert!(parse_wm_size("Physical size: 0x0\n").is_err());
+        assert!(parse_wm_size("garbage\n").is_err());
     }
 }

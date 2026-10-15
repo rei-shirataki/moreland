@@ -5,7 +5,7 @@
 //! ```text
 //! appsrc  video/x-raw(memory:DMABuf) DMA_DRM XR24:<modifier>
 //!   -> vapostproc     XR24 -> NV12, on the GPU
-//!   -> vah264enc      CBR, no B-frames, sparse keyframes
+//!   -> vah264enc      VBR (default), no B-frames, sparse keyframes
 //!   -> h264parse      Annex-B, SPS/PPS ahead of every IDR
 //!   -> appsink
 //! ```
@@ -59,7 +59,7 @@ pub fn supported_modifiers(fourcc: u32) -> Option<Vec<u64>> {
                     let Ok(value) = structure.value("drm-format") else {
                         continue;
                     };
-                    collect_modifiers(&value, &wanted, &mut modifiers);
+                    collect_modifiers(value, &wanted, &mut modifiers);
                 }
             }
         }
@@ -157,7 +157,7 @@ fn supported_modifiers_strict(wanted: &str) -> Vec<u64> {
                     continue;
                 }
                 if let Ok(value) = structure.value("drm-format") {
-                    collect_modifiers(&value, wanted, &mut modifiers);
+                    collect_modifiers(value, wanted, &mut modifiers);
                 }
             }
         }
@@ -251,11 +251,7 @@ impl Encoder {
     pub fn new(config: &EncoderConfig) -> Result<Self> {
         gst::init().context("initialising GStreamer")?;
 
-        let drm_format = format!(
-            "{}:0x{:016x}",
-            fourcc_name(config.fourcc),
-            config.modifier
-        );
+        let drm_format = format!("{}:0x{:016x}", fourcc_name(config.fourcc), config.modifier);
 
         // DMA_DRM caps carry the tiling; the encoder chain stays on the GPU
         // from here to the bitstream — when the driver can import the format.
@@ -267,10 +263,7 @@ impl Encoder {
                 .field("drm-format", &drm_format)
                 .field("width", config.width as i32)
                 .field("height", config.height as i32)
-                .field(
-                    "framerate",
-                    gst::Fraction::new(config.framerate as i32, 1),
-                )
+                .field("framerate", gst::Fraction::new(config.framerate as i32, 1))
                 .build();
             (caps, VideoFormat::DmaDrm)
         } else {
@@ -292,10 +285,7 @@ impl Encoder {
                 .field("format", format)
                 .field("width", config.width as i32)
                 .field("height", config.height as i32)
-                .field(
-                    "framerate",
-                    gst::Fraction::new(config.framerate as i32, 1),
-                )
+                .field("framerate", gst::Fraction::new(config.framerate as i32, 1))
                 .build();
             let video_format = match format {
                 "BGRx" => VideoFormat::Bgrx,
@@ -552,6 +542,10 @@ fn inspect_dmabuf(
     Ok((OwnedFd::from(file), (meta.dev(), meta.ino()), size))
 }
 
+/// A DRM fourcc as GStreamer spells it in `drm-format` caps: the four raw
+/// bytes, padding spaces included (`R8  `). Deliberately not
+/// `capture::session::fourcc_name`, whose hex fallback for unprintable bytes
+/// suits logs but would never match a caps string.
 fn fourcc_name(code: u32) -> String {
     String::from_utf8_lossy(&code.to_le_bytes()).into_owned()
 }
@@ -559,6 +553,12 @@ fn fourcc_name(code: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caps_fourcc_keeps_padding_spaces() {
+        assert_eq!(fourcc_name(u32::from_le_bytes(*b"R8  ")), "R8  ");
+        assert_eq!(fourcc_name(u32::from_le_bytes(*b"XR24")), "XR24");
+    }
 
     /// `vapostproc`'s `memory:DMABuf` sink caps on Intel iHD 26.2.4, copied
     /// verbatim from the `GST_DEBUG` dump @camradex attached to issue #3

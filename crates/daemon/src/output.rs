@@ -17,6 +17,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::process::Command;
+use transport::process::run_with_timeout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compositor {
@@ -118,9 +119,9 @@ fn desktop_names(desktop: &str, wanted: &str) -> bool {
 }
 
 fn run(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    let output = run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
         .with_context(|| format!("running `{program} {}`", args.join(" ")))?;
     if !output.status.success() {
         bail!(
@@ -160,8 +161,7 @@ struct MonitorState {
 }
 
 fn hyprland_monitor_state() -> Result<Vec<MonitorState>> {
-    let json =
-        run("hyprctl", &["monitors", "-j"]).context("reading Hyprland monitor state")?;
+    let json = run("hyprctl", &["monitors", "-j"]).context("reading Hyprland monitor state")?;
 
     let monitors: serde_json::Value =
         serde_json::from_str(&json).context("parsing Hyprland monitor JSON")?;
@@ -396,8 +396,8 @@ impl VirtualOutput {
                 });
             }
             Compositor::Hyprland => {
-                let saved_states = hyprland_monitor_state()
-                    .context("saving Hyprland monitor state")?;
+                let saved_states =
+                    hyprland_monitor_state().context("saving Hyprland monitor state")?;
 
                 let existing = saved_states.iter().find(|monitor| monitor.name == name);
                 // An existing output by our own default name is one a crashed
@@ -473,9 +473,14 @@ impl VirtualOutput {
             name: name.to_string(),
             borrowed: None,
             parser: HyprParser::Legacy,
-                    refresh,
-                    position: (x, y),
+            refresh,
+            position: (x, y),
         })
+    }
+
+    /// Whether this compositor and output can be resized at runtime.
+    pub fn can_resize(&self) -> bool {
+        self.compositor == Compositor::Hyprland && self.borrowed.is_none()
     }
 
     pub fn name(&self) -> &str {
@@ -520,11 +525,14 @@ impl VirtualOutput {
     }
 
     /// Change the mode of the output while it stays in the layout, for a tablet
-    /// that was rotated. Returns false when this compositor leaves the output
-    /// alone (labwc), in which case the caller keeps the size it has.
-    pub fn resize(&self, width: u32, height: u32) -> Result<bool> {
-        if self.compositor != Compositor::Hyprland || self.borrowed.is_some() {
-            return Ok(false);
+    /// that was rotated. Only valid when [`can_resize`](Self::can_resize).
+    pub fn resize(&self, width: u32, height: u32) -> Result<()> {
+        if !self.can_resize() {
+            bail!(
+                "{} output {} cannot be resized",
+                self.compositor.name(),
+                self.name
+            );
         }
         let (x, y) = self.position;
         let refresh = self.refresh;
@@ -546,7 +554,7 @@ impl VirtualOutput {
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
-        Ok(true)
+        Ok(())
     }
 
     /// Whether the requested mode and position were actually applied. False on

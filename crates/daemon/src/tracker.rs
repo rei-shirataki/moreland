@@ -14,7 +14,14 @@ use std::net::TcpStream;
 use std::process::Command;
 use std::time::Duration;
 
-const ADB_SERVER: &str = "127.0.0.1:5037";
+fn adb_server_addr() -> String {
+    server_addr_for(std::env::var("ANDROID_ADB_SERVER_PORT").ok().as_deref())
+}
+
+fn server_addr_for(port: Option<&str>) -> String {
+    let port = port.and_then(|p| p.parse::<u16>().ok()).unwrap_or(5037);
+    format!("127.0.0.1:{port}")
+}
 
 /// How long a message, once begun, may take to arrive in full. The ADB server
 /// writes each one at once, so this only bounds a server that died mid-write.
@@ -40,15 +47,22 @@ pub struct DeviceTracker {
 
 impl DeviceTracker {
     pub fn connect() -> Result<Self> {
-        // Idempotent; brings the server up if this is the first client.
-        let _ = Command::new(
-            std::env::var("MORELAND_ADB").unwrap_or_else(|_| "adb".into()),
-        )
-        .arg("start-server")
-        .output();
+        let adb_bin = std::env::var("MORELAND_ADB").unwrap_or_else(|_| "adb".into());
+        // Idempotent; brings the server up if this is the first client. A
+        // failure here is not fatal: the server may already be listening even
+        // when `adb` itself is not on this unit's PATH, and the connect below
+        // is what decides. Output is captured so adb's "daemon not running;
+        // starting now" chatter stays out of the journal.
+        if let Err(e) = transport::process::run_with_timeout(
+            Command::new(&adb_bin).arg("start-server"),
+            Duration::from_secs(5),
+        ) {
+            tracing::debug!("`{adb_bin} start-server`: {e:#}");
+        }
 
-        let mut stream = TcpStream::connect(ADB_SERVER)
-            .with_context(|| format!("connecting to the ADB server at {ADB_SERVER}"))?;
+        let addr = adb_server_addr();
+        let mut stream = TcpStream::connect(&addr)
+            .with_context(|| format!("connecting to the ADB server at {addr}"))?;
 
         send_request(&mut stream, "host:track-devices")?;
         Ok(Self { stream })
@@ -106,7 +120,9 @@ fn send_request(stream: &mut TcpStream, request: &str) -> Result<()> {
 
 fn read_payload(stream: &mut TcpStream) -> Result<String> {
     let mut len_hex = [0u8; 4];
-    stream.read_exact(&mut len_hex).context("reading ADB length")?;
+    stream
+        .read_exact(&mut len_hex)
+        .context("reading ADB length")?;
     let len = usize::from_str_radix(
         std::str::from_utf8(&len_hex).context("ADB length was not UTF-8")?,
         16,
@@ -161,7 +177,10 @@ mod tests {
     #[test]
     fn no_update_within_the_wait_is_not_an_error() {
         let (mut tracker, _server) = tracker_with_server();
-        assert!(tracker.next_update(Duration::from_millis(20)).unwrap().is_none());
+        assert!(tracker
+            .next_update(Duration::from_millis(20))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -190,5 +209,12 @@ mod tests {
         let (mut tracker, server) = tracker_with_server();
         drop(server);
         assert!(tracker.next_update(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn parses_default_adb_server_addr() {
+        assert_eq!(server_addr_for(None), "127.0.0.1:5037");
+        assert_eq!(server_addr_for(Some("5038")), "127.0.0.1:5038");
+        assert_eq!(server_addr_for(Some("not-a-port")), "127.0.0.1:5037");
     }
 }
