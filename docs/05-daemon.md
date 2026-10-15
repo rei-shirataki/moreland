@@ -147,17 +147,34 @@ moreland                 watch for the tablet; stream whenever plugged in
 moreland --once          stream one session, then exit
 moreland --seconds 15    stop after 15 s, print latency statistics
 moreland --stats         print latency statistics on exit
+moreland stop            stop streaming without stopping the daemon
+moreland start           resume after `moreland stop`
+moreland status          streaming / stopped / waiting
 moreland --max-width 2400        cap the auto-detected width
 moreland --native                stream the tablet's full panel resolution
 moreland --width 2400 --height 1500   pin an explicit size (both required)
 moreland --bitrate 30000
 ```
 
+### Stopping without disabling auto-start
+
+`moreland stop` talks to the running daemon over
+`$XDG_RUNTIME_DIR/moreland.sock`. It ends the session and removes the virtual
+monitor, but the daemon keeps watching. The tablet is not streamed to again
+until it is physically reconnected — it leaves adb's device list and comes
+back — or until `moreland start`. `systemctl --user stop moreland` still exits
+the daemon altogether.
+
+The stop lives in the daemon's memory, so a daemon restart forgets it. A
+tablet that drops off adb's list without being unplugged (`adb kill-server`,
+a USB mode switch) counts as reconnected.
+
 ## Code
 
 ```
 crates/daemon/
   src/main.rs         daemon loop, CLI, signal handling
+  src/control.rs      `moreland stop|start|status` control socket
   src/tracker.rs      ADB host:track-devices client
   src/session.rs      one streaming session, RAII-scoped
   src/output.rs       virtual output guard, per-compositor

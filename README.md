@@ -134,6 +134,12 @@ moreland                  watch for the tablet; stream whenever plugged in
 moreland --once           stream one session, then exit
 moreland --seconds 15     stop after 15 s and print latency statistics
 
+moreland stop             stop streaming; the running daemon keeps going and
+                          stays stopped until the tablet is unplugged and
+                          plugged back in, or `moreland start`
+moreland start            resume streaming after `moreland stop`
+moreland status           what the running daemon is doing
+
 --max-width <PX>           cap the auto-detected width   [default: 1920]
 --native                   stream at the tablet's full panel resolution
 --width <PX> --height <PX> pin an explicit resolution (both required)
