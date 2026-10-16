@@ -385,6 +385,7 @@ wrong:
 | [03-transport.md](docs/03-transport.md)         | Wire protocol and USB transport                                |
 | [04-android-app.md](docs/04-android-app.md)     | The tablet app                                                 |
 | [05-daemon.md](docs/05-daemon.md)               | Hotplug detection and the service                              |
+| [WIRELESS.md](docs/WIRELESS.md)                 | Design for a wireless (Wi-Fi) transport - not implemented      |
 | [COMPATIBILITY.md](docs/COMPATIBILITY.md)       | What other compositors and GPUs need                           |
 | [REVERT.md](docs/REVERT.md)                     | How to undo everything                                         |
 
