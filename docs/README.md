@@ -17,6 +17,7 @@ backed by a measurement taken on that hardware.
 | [04-android-app.md](04-android-app.md) | Stage 4 — Android decoder app, build and install |
 | [05-daemon.md](05-daemon.md) | Stage 5 — daemon, hotplug detection, systemd service |
 | [06-plasma-backend.md](06-plasma-backend.md) | Stage 6 — KDE Plasma: why it is blocked, and the grant that unblocks it |
+| [WIRELESS.md](WIRELESS.md) | Wireless over Wi-Fi: design for a direct TLS transport (not implemented) |
 | [COMPATIBILITY.md](COMPATIBILITY.md) | What each compositor and distribution needs |
 | [REVERT.md](REVERT.md) | How to undo everything this project touches |
 
