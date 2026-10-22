@@ -3,9 +3,10 @@
 package com.moreland.display
 
 import android.app.Activity
+import android.content.Context
 import android.content.res.Configuration
-import android.graphics.Point
 import android.graphics.Color
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -28,13 +29,28 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var surfaceView: SurfaceView
     private lateinit var status: TextView
     private var stream: VideoStream? = null
+    private var reportedSize: Pair<Int, Int>? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private val refreshStatusTask = Runnable { refreshStatus() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Only worth holding when the host is reached over Wi-Fi; over USB the
+        // radio is irrelevant and the lock would just cost battery.
+        if (intent.getBooleanExtra(Protocol.WIRELESS_EXTRA, false)) {
+            wifiLock = (applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager)
+                ?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "moreland")
+                ?.apply { setReferenceCounted(false) }
+        }
+
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setBackgroundDrawableResource(android.R.color.black)
+        // Landscape would otherwise leave a black band beside the cutout.
+        window.attributes = window.attributes.apply {
+            layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
 
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
@@ -124,26 +140,41 @@ class DisplayActivity : Activity(), SurfaceHolder.Callback {
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         stream?.setSurface(holder.surface)
-        reportDisplaySize()
+        // The surface is laid out at the new size, unlike getRealSize, which
+        // can still return the old orientation while the rotation settles.
+        reportDisplaySize(width, height)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        reportDisplaySize()
+        // The system bars come back on rotation and shift the layout.
+        goImmersive()
     }
 
     /** The host sizes its virtual output to this, so it follows rotation. */
-    @Suppress("DEPRECATION")
-    private fun reportDisplaySize() {
-        val size = Point()
-        windowManager.defaultDisplay.getRealSize(size)
-        if (size.x > 0 && size.y > 0) stream?.reportDisplaySize(size.x, size.y)
+    private fun reportDisplaySize(width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+        if (reportedSize == width to height) return
+        reportedSize = width to height
+        stream?.reportDisplaySize(width, height)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         // The view no longer receives the matching ups for contacts in flight.
         stream?.releaseTouches()
         stream?.setSurface(null)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Keeps the radio out of power-save while the stream is on screen.
+        // The low-latency mode only takes effect in the foreground.
+        wifiLock?.takeIf { !it.isHeld }?.acquire()
+    }
+
+    override fun onPause() {
+        wifiLock?.takeIf { it.isHeld }?.release()
+        super.onPause()
     }
 
     override fun onDestroy() {

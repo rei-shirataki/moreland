@@ -145,10 +145,10 @@ moreland status           what the running daemon is doing
 --width <PX> --height <PX> pin an explicit resolution (both required)
 --fps <N>                  virtual output refresh rate   [default: 90]
 --bitrate <KBPS>           H.264 target bitrate          [default: 20000]
---position <X>             x offset of the virtual output [default: 0]
---position-y <Y>           y offset of the virtual output [default: 1080]
-                           default sits below a primary at 0x0, no taller
-                           than 1080px; override either axis to fit your
+--position <X>             x offset of the virtual output [default: 1920]
+--position-y <Y>           y offset of the virtual output [default: 0]
+                           default sits right of a primary at 0x0, no wider
+                           than 1920px; override either axis to fit your
                            layout
 --output-name <NAME>       name of the virtual output    [default: moreland]
                            required on labwc, which cannot create one and

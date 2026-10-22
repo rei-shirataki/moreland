@@ -19,6 +19,9 @@ object Protocol {
     /** Intent extra carrying this session's socket name from the daemon. */
     const val SOCKET_EXTRA = "com.moreland.display.SOCKET"
 
+    /** Intent extra, true when the daemon reaches this device over Wi-Fi. */
+    const val WIRELESS_EXTRA = "com.moreland.display.WIRELESS"
+
     private val SOCKET_NAME_PATTERN = Regex("[A-Za-z0-9._-]{1,64}")
 
     /** The socket named in the launch intent, or the default when absent or malformed. */
@@ -133,6 +136,7 @@ object Protocol {
     const val TAG_ACK = 0x01
     const val TAG_TOUCH = 0x02
     const val TAG_ORIENTATION = 0x03
+    const val TAG_KEYFRAME = 0x04
 
     /** Touch coordinates run 0..TOUCH_EXTENT across the streamed image. */
     const val TOUCH_EXTENT = 65535
@@ -166,6 +170,9 @@ object Protocol {
         (ptsNs ushr 8).toByte(),
         ptsNs.toByte(),
     )
+
+    /** Ask the host for a keyframe now; the decoder was rebuilt and has no reference. */
+    fun encodeKeyframeRequest(): ByteArray = byteArrayOf(TAG_KEYFRAME.toByte())
 
     /** Tell the host the display is now `width` x `height` (it was rotated). */
     fun encodeOrientation(width: Int, height: Int): ByteArray = byteArrayOf(

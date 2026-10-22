@@ -354,6 +354,8 @@ pub struct VirtualOutput {
     /// reissues the same rule with only the size changed.
     refresh: u32,
     position: (i32, i32),
+    /// Display scaling factor applied to the output, kept for resizes.
+    scale: f64,
 }
 
 impl VirtualOutput {
@@ -364,6 +366,7 @@ impl VirtualOutput {
         refresh: u32,
         x: i32,
         y: i32,
+        scale: f64,
     ) -> Result<Self> {
         let compositor = Compositor::detect();
         match compositor {
@@ -393,6 +396,7 @@ impl VirtualOutput {
                     parser: HyprParser::Legacy,
                     refresh,
                     position: (x, y),
+                    scale,
                 });
             }
             Compositor::Hyprland => {
@@ -431,9 +435,10 @@ impl VirtualOutput {
                     parser: HyprParser::Legacy,
                     refresh,
                     position: (x, y),
+                    scale,
                 };
 
-                let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},1");
+                let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},{scale}");
                 let reply = run("hyprctl", &["keyword", "monitor", &spec])
                     .with_context(|| format!("configuring output as {spec}"))?;
 
@@ -446,7 +451,7 @@ impl VirtualOutput {
                     let lua = format!(
                         "hl.monitor({{ output = {}, \
                          mode = \"{width}x{height}@{refresh}\", \
-                         position = \"{x}x{y}\", scale = 1 }})",
+                         position = \"{x}x{y}\", scale = {scale} }})",
                         lua_string(name)
                     );
                     run("hyprctl", &["eval", &lua])
@@ -475,6 +480,7 @@ impl VirtualOutput {
             parser: HyprParser::Legacy,
             refresh,
             position: (x, y),
+            scale,
         })
     }
 
@@ -536,23 +542,41 @@ impl VirtualOutput {
         }
         let (x, y) = self.position;
         let refresh = self.refresh;
+        let scale = self.scale;
         let name = &self.name;
         match self.parser {
             HyprParser::Legacy => {
-                let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},1");
+                let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},{scale}");
                 run("hyprctl", &["keyword", "monitor", &spec])
                     .with_context(|| format!("resizing output as {spec}"))?;
             }
             HyprParser::Lua => {
                 let lua = format!(
                     "hl.monitor({{ output = {}, mode = \"{width}x{height}@{refresh}\", \
-                     position = \"{x}x{y}\", scale = 1 }})",
+                     position = \"{x}x{y}\", scale = {scale} }})",
                     lua_string(name)
                 );
                 run("hyprctl", &["eval", &lua])
                     .with_context(|| format!("resizing output as {lua}"))?;
             }
         }
+        // Layer-shell clients (bars, overviews) re-lay themselves out only once
+        // the compositor has really switched mode, and capturing earlier
+        // streams a half-resized desktop. Wait for the mode, not a fixed time.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let applied = hyprland_monitor_state()
+                .map(|all| {
+                    all.iter()
+                        .any(|m| m.name == *name && m.width == width && m.height == height)
+                })
+                .unwrap_or(false);
+            if applied || std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        // Clients still need a moment to reconfigure to the new size.
         std::thread::sleep(std::time::Duration::from_millis(300));
         Ok(())
     }

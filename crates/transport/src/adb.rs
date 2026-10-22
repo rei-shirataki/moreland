@@ -60,6 +60,14 @@ pub fn devices() -> Result<Vec<Device>> {
     Ok(devices)
 }
 
+/// Whether `serial` names a device reached over Wi-Fi rather than USB.
+///
+/// Wireless debugging serials are either `<ip>:<port>` (`adb connect`) or an
+/// mDNS name ending in `_adb-tls-connect._tcp`; USB serials are neither.
+pub fn is_wireless(serial: &str) -> bool {
+    serial.contains("_adb-tls-connect") || serial.contains(':')
+}
+
 /// An `adb forward` rule, removed when dropped.
 ///
 /// The remote spec is a `localabstract:` socket in production so traffic never
@@ -124,12 +132,10 @@ pub fn shell(serial: &str, command: &str) -> Result<String> {
     adb(&["-s", serial, "shell", command])
 }
 
-/// The device's physical panel size, in **landscape** orientation.
+/// The device's panel size in its natural orientation, as `wm size` reports it.
 ///
-/// `wm size` reports the panel as the hardware sees it, which on a tablet is
-/// portrait (e.g. `1800x2880`). The virtual output is landscape, so the axes
-/// are swapped here rather than at every call site.
-pub fn parse_wm_size(out: &str) -> Result<(u32, u32)> {
+/// A tablet's natural orientation is usually portrait (e.g. `1800x2880`).
+fn parse_wm_size_natural(out: &str) -> Result<(u32, u32)> {
     let parse = |prefix: &str| -> Option<(u32, u32)> {
         let line = out.lines().find(|l| l.trim().starts_with(prefix))?;
         let spec = line.split(':').nth(1)?.trim();
@@ -144,12 +150,56 @@ pub fn parse_wm_size(out: &str) -> Result<(u32, u32)> {
     if w == 0 || h == 0 {
         bail!("device reported a zero display dimension: {w}x{h}");
     }
+    Ok((w, h))
+}
+
+/// The device's physical panel size, in **landscape** orientation.
+///
+/// `wm size` reports the panel as the hardware sees it, which on a tablet is
+/// portrait. The virtual output is landscape unless the device says
+/// otherwise, so the axes are swapped here rather than at every call site.
+pub fn parse_wm_size(out: &str) -> Result<(u32, u32)> {
+    let (w, h) = parse_wm_size_natural(out)?;
     Ok(if w >= h { (w, h) } else { (h, w) })
 }
 
 pub fn display_size(serial: &str) -> Result<(u32, u32)> {
     let out = shell(serial, "wm size").context("querying device display size")?;
     parse_wm_size(&out)
+}
+
+/// The display's current rotation (0..=3) from `dumpsys window displays`.
+///
+/// Odd values are a quarter turn from the natural orientation. Accepts both
+/// `mCurRotation=1` and the symbolic `mCurRotation=ROTATION_90`.
+pub fn parse_rotation(out: &str) -> Option<u32> {
+    let rest = out.split("mCurRotation=").nth(1)?;
+    let (rest, degrees) = match rest.strip_prefix("ROTATION_") {
+        Some(symbolic) => (symbolic, true),
+        None => (rest, false),
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let n: u32 = digits.parse().ok()?;
+    // The symbolic form names degrees, the numeric form a quarter-turn count.
+    Some(if degrees { n / 90 } else { n } % 4)
+}
+
+/// The display's size as the app will see it right now, rotation included.
+///
+/// The app follows the device's rotation and reports its size once it is
+/// running, which used to be the first the host heard of a portrait tablet:
+/// the output was built landscape, then torn down and rebuilt. Asking up
+/// front lets the first pipeline be the right one. `None` when the rotation
+/// cannot be read, in which case the caller falls back to [`display_size`]
+/// and the device's own report still corrects it later.
+pub fn current_display_size(serial: &str) -> Option<(u32, u32)> {
+    let natural = parse_wm_size_natural(&shell(serial, "wm size").ok()?).ok()?;
+    let rotation = parse_rotation(&shell(serial, "dumpsys window displays").ok()?)?;
+    Some(if rotation % 2 == 1 {
+        (natural.1, natural.0)
+    } else {
+        natural
+    })
 }
 
 /// Pick a streaming resolution matching the device's aspect ratio.
@@ -243,6 +293,22 @@ mod tests {
                 "aspect drift for {panel:?}: wanted {want:.4}, got {got:.4}"
             );
         }
+    }
+
+    #[test]
+    fn tells_wireless_serials_from_usb() {
+        assert!(is_wireless("adb-V4QBB20507200467-4Rxq8Y._adb-tls-connect._tcp"));
+        assert!(is_wireless("192.168.0.5:5555"));
+        assert!(!is_wireless("V4QBB20507200467"));
+    }
+
+    #[test]
+    fn parses_rotation_numeric_and_symbolic() {
+        assert_eq!(parse_rotation("    mCurRotation=0 mOriginalRotation=1\n"), Some(0));
+        assert_eq!(parse_rotation("mCurRotation=1 x"), Some(1));
+        assert_eq!(parse_rotation("mCurRotation=ROTATION_90 x"), Some(1));
+        assert_eq!(parse_rotation("mCurRotation=ROTATION_270"), Some(3));
+        assert_eq!(parse_rotation("nothing here"), None);
     }
 
     #[test]
