@@ -96,6 +96,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
                 | "--target-usage"
                 | "--position"
                 | "--position-y"
+                | "--scale"
                 | "--output-name"
                 | "--seconds"
         );
@@ -124,6 +125,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             "--target-usage" => config.target_usage = number(&flag, &value()?, 1, 7)?,
             "--position" => config.position_x = number(&flag, &value()?, i32::MIN, i32::MAX)?,
             "--position-y" => config.position_y = number(&flag, &value()?, i32::MIN, i32::MAX)?,
+            "--scale" => {
+                let text = value()?;
+                config.scale = text
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| (0.5..=4.0).contains(v))
+                    .ok_or_else(|| format!("--scale {text:?} must be a number in 0.5..4"))?;
+            }
             "--output-name" => {
                 let name = value()?;
                 // The name is spliced into `hyprctl keyword monitor` rules,

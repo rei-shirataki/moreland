@@ -38,6 +38,9 @@ class VideoStream(private val socketName: String) {
         const val INPUT_TIMEOUT_MS = 2000L
         const val SURFACE_WAIT_MS = 5000L
         const val MAX_QUEUED_MOVES = 256
+        /** Decoder rebuilds allowed per window before the session is given up on. */
+        const val MAX_DECODER_RECOVERIES = 3
+        const val RECOVERY_WINDOW_MS = 30_000L
     }
 
     @Volatile private var running = false
@@ -48,6 +51,8 @@ class VideoStream(private val socketName: String) {
     @Volatile private var client: LocalSocket? = null
     @Volatile private var thread: Thread? = null
     @Volatile private var ackThread: Thread? = null
+    /** Set by the codec callback when the decoder died; the session loop rebuilds it. */
+    @Volatile private var decoderFailed = false
 
     private val freeInputs = LinkedBlockingQueue<Int>()
     /** Encoded device-to-host messages, written by one thread so they never interleave. */
@@ -225,6 +230,10 @@ class VideoStream(private val socketName: String) {
         startAckWriter(output)
         connected = true
 
+        var streamHeader = header
+        var awaitKeyframe = false
+        val recoveries = ArrayDeque<Long>()
+        decoderFailed = false
         try {
             var scratch = ByteArray(256 * 1024)
             while (running) {
@@ -239,6 +248,9 @@ class VideoStream(private val socketName: String) {
                         runCatching { codec.stop() }
                         runCatching { codec.release() }
                         freeInputs.clear()
+                        streamHeader = h
+                        decoderFailed = false
+                        awaitKeyframe = false
                         codec = configureCodec(h, awaitSurface())
                         this.codec = codec
                         continue
@@ -248,6 +260,36 @@ class VideoStream(private val socketName: String) {
                     scratch = ByteArray(frame.length)
                 }
                 Protocol.readFully(input, scratch, frame.length)
+
+                if (decoderFailed) {
+                    // The decoder died (some hardware decoders assert on a bad
+                    // access unit). Rebuild it in place rather than dropping the
+                    // connection, which costs seconds of host-side setup. Give
+                    // up if it keeps dying, so a broken decoder cannot spin.
+                    decoderFailed = false
+                    val now = System.currentTimeMillis()
+                    while (recoveries.isNotEmpty() && now - recoveries.first() > RECOVERY_WINDOW_MS) {
+                        recoveries.removeFirst()
+                    }
+                    if (recoveries.size >= MAX_DECODER_RECOVERIES) {
+                        throw IOException("decoder failed $MAX_DECODER_RECOVERIES times in ${RECOVERY_WINDOW_MS / 1000}s")
+                    }
+                    recoveries.addLast(now)
+                    Log.w(TAG, "rebuilding decoder after error")
+                    this.codec = null
+                    runCatching { codec.stop() }
+                    runCatching { codec.release() }
+                    freeInputs.clear()
+                    codec = configureCodec(streamHeader, awaitSurface())
+                    this.codec = codec
+                    // Nothing before the next keyframe can be decoded.
+                    awaitKeyframe = true
+                    outgoing.offer(Protocol.encodeKeyframeRequest())
+                }
+                if (awaitKeyframe) {
+                    if (!frame.keyframe) continue
+                    awaitKeyframe = false
+                }
 
                 val index = freeInputs.poll(INPUT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                 if (index == null) {
@@ -334,7 +376,16 @@ class VideoStream(private val socketName: String) {
                     // session failing. Render first, account after; the
                     // acknowledgement is queued so this callback never blocks.
                     val render = surface?.isValid == true
-                    runCatching { codec.releaseOutputBuffer(index, render) }
+                    // Pass a render time (now) instead of a bare flag so the
+                    // frame is queued for the next vsync explicitly rather than
+                    // at whatever point the release happens to land.
+                    runCatching {
+                        if (render) {
+                            codec.releaseOutputBuffer(index, System.nanoTime())
+                        } else {
+                            codec.releaseOutputBuffer(index, false)
+                        }
+                    }
                     if (render) {
                         framesDecoded++
                         outgoing.offer(Protocol.encodeAck(info.presentationTimeUs * 1000))
@@ -350,11 +401,13 @@ class VideoStream(private val socketName: String) {
                         return
                     }
                     Log.e(TAG, "codec error: ${e.message}", e)
-                    // Anything else needs the codec stopped and reconfigured at
-                    // the least (isRecoverable) or rebuilt. Reconnecting does
-                    // exactly that, so abort the session: the host learns of the
-                    // failure and the app returns to listening.
-                    runCatching { client?.close() }
+                    // Anything else needs the codec rebuilt. Flag it for the
+                    // session loop, which owns the codec and does so on the
+                    // next frame without dropping the connection.
+                    val live = this@VideoStream.codec
+                    if (live == null || live === codec) {
+                        decoderFailed = true
+                    }
                 }
 
                 override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {

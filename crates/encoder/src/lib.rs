@@ -506,6 +506,14 @@ impl Encoder {
         Ok(())
     }
 
+    /// Ask the encoder to emit an IDR (with SPS/PPS) for the next frame.
+    pub fn request_keyframe(&self) {
+        let event = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
+            .build();
+        let _ = self.pipeline.send_event(event);
+    }
+
     pub fn stop(&self) {
         let _ = self.appsrc.end_of_stream();
         let _ = self.pipeline.set_state(gst::State::Null);

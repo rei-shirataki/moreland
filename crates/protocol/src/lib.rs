@@ -32,6 +32,8 @@
 //! TOUCH       (7 bytes)  tag 0x02, action u8, slot u8, x u16, y u16
 //! ORIENTATION (5 bytes)  tag 0x03, width u16, height u16
 //!                        the device's current display size, e.g. after rotation
+//! KEYFRAME    (1 byte)   tag 0x04
+//!                        the decoder was rebuilt and needs a keyframe now
 //! ```
 //!
 //! Touch coordinates are normalised to `0..=TOUCH_EXTENT` across the whole
@@ -59,6 +61,9 @@ pub const DEFAULT_PORT: u16 = 27183;
 pub const SOCKET_NAME: &str = "moreland";
 /// Intent string extra naming the socket the app should listen on.
 pub const SOCKET_EXTRA: &str = "com.moreland.display.SOCKET";
+/// Boolean intent extra set when the device is reached over Wi-Fi (wireless
+/// debugging), so the app can hold a low-latency Wi-Fi lock.
+pub const WIRELESS_EXTRA: &str = "com.moreland.display.WIRELESS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -165,6 +170,7 @@ impl FrameHeader {
 pub const TAG_ACK: u8 = 0x01;
 pub const TAG_TOUCH: u8 = 0x02;
 pub const TAG_ORIENTATION: u8 = 0x03;
+pub const TAG_KEYFRAME: u8 = 0x04;
 
 /// Device → host acknowledgement, sent when a frame is handed to the display.
 ///
@@ -237,6 +243,9 @@ pub enum DeviceMessage {
         height: u16,
     },
     Touch(TouchEvent),
+    /// The device rebuilt its decoder and cannot show anything until the next
+    /// keyframe, which would otherwise be up to a full keyframe interval away.
+    KeyframeRequest,
 }
 
 pub fn encode_orientation(width: u16, height: u16) -> [u8; ORIENTATION_LEN] {
@@ -282,6 +291,7 @@ pub fn parse_device_message(buf: &[u8]) -> Result<Option<(DeviceMessage, usize)>
             };
             Ok(Some((message, ORIENTATION_LEN)))
         }
+        TAG_KEYFRAME => Ok(Some((DeviceMessage::KeyframeRequest, 1))),
         TAG_TOUCH => {
             if buf.len() < TOUCH_LEN {
                 return Ok(None);
@@ -357,6 +367,14 @@ mod tests {
                 },
                 ACK_LEN
             ))
+        );
+    }
+
+    #[test]
+    fn keyframe_request_is_a_single_byte() {
+        assert_eq!(
+            parse_device_message(&[TAG_KEYFRAME, TAG_ACK]).unwrap(),
+            Some((DeviceMessage::KeyframeRequest, 1))
         );
     }
 

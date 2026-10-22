@@ -54,6 +54,8 @@ pub struct Config {
     pub max_in_flight_explicit: bool,
     pub position_x: i32,
     pub position_y: i32,
+    /// Display scaling factor of the virtual output (UI size multiplier).
+    pub scale: f64,
     pub output_name: String,
     /// Composite the mouse cursor into the streamed frames.
     pub paint_cursor: bool,
@@ -82,13 +84,14 @@ impl Default for Config {
             fps_explicit: false,
             bitrate_explicit: false,
             max_in_flight_explicit: false,
-            // Below a primary at 0x0, starting at y = 1080. This assumes the
-            // primary is no taller than 1080px — on a taller display the
-            // virtual output would overlap it rather than sit below. Override
-            // with `--position`/`--position-y` if that does not hold for your
-            // layout.
-            position_x: 0,
-            position_y: 1080,
+            // Right of a primary at 0x0, starting at x = 1920. This assumes
+            // the primary is no wider than 1920px — on a wider display the
+            // virtual output would overlap it rather than sit beside it.
+            // Override with `--position`/`--position-y` if that does not hold
+            // for your layout.
+            position_x: 1920,
+            position_y: 0,
+            scale: 1.25,
             output_name: capture::VIRTUAL_OUTPUT_NAME.to_string(),
             paint_cursor: false,
             touch: true,
@@ -165,14 +168,28 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     }
 
     // Match the tablet's own aspect ratio unless told otherwise, so the image
-    // fills its screen instead of letterboxing.
+    // fills its screen instead of letterboxing. The orientation is read now,
+    // not left for the device's report: building the output landscape for a
+    // portrait tablet costs a full pipeline rebuild a few seconds in.
+    let current = adb::current_display_size(serial);
+    let portrait = current.is_some_and(|(w, h)| h > w);
     let (width, height) = match config.resolution {
-        Some(explicit) => explicit,
+        Some((w, h)) => {
+            let (long, short) = (w.max(h), w.min(h));
+            if portrait {
+                (short, long)
+            } else {
+                (long, short)
+            }
+        }
         None => {
-            let panel = adb::display_size(serial)?;
+            let panel = match current {
+                Some(size) => size,
+                None => adb::display_size(serial)?,
+            };
             let scaled = adb::stream_resolution(panel, config.max_width);
             tracing::info!(
-                "device panel {}x{} (landscape) -> streaming {}x{}",
+                "device display {}x{} -> streaming {}x{}",
                 panel.0,
                 panel.1,
                 scaled.0,
@@ -189,6 +206,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         config.fps,
         config.position_x,
         config.position_y,
+        config.scale,
     )?;
     if output.applied_mode() {
         tracing::info!(
@@ -231,8 +249,10 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     adb::shell(
         serial,
         &format!(
-            "am start -n {APP_ACTIVITY} --es {} {socket}",
-            protocol::SOCKET_EXTRA
+            "am start -n {APP_ACTIVITY} --es {} {socket} --ez {} {}",
+            protocol::SOCKET_EXTRA,
+            protocol::WIRELESS_EXTRA,
+            adb::is_wireless(serial),
         ),
     )
     .context("launching the display app")?;
@@ -313,6 +333,9 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
     let last_ack: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
     // The device's latest reported display size, until the loop acts on it.
     let reported: Arc<Mutex<Option<(u16, u16)>>> = Arc::new(Mutex::new(None));
+    // Set by the device when it rebuilt its decoder; the capture loop turns it
+    // into a forced keyframe on whichever encoder is current.
+    let keyframe_wanted = Arc::new(AtomicBool::new(false));
 
     // Created after the output exists so the compositor can bind the device to
     // it. Touch is optional: without /dev/uinput access the display still works.
@@ -348,6 +371,7 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         let round_trips = Arc::clone(&round_trips);
         let alive = Arc::clone(&alive);
         let reported = Arc::clone(&reported);
+        let keyframe_wanted = Arc::clone(&keyframe_wanted);
         let record_stats = config.stats;
         std::thread::spawn(move || {
             // Messages are small and fixed-length per tag; one can arrive
@@ -386,6 +410,9 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                                                     "ignoring invalid orientation dimensions: {width}x{height}"
                                                 );
                                             }
+                                        }
+                                        protocol::DeviceMessage::KeyframeRequest => {
+                                            keyframe_wanted.store(true, Ordering::Relaxed);
                                         }
                                         protocol::DeviceMessage::Touch(event) => {
                                             if let Some(injector) = touch_in.as_mut() {
@@ -531,6 +558,10 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
                 let dmabuf = capture
                     .dmabuf(timing.buffer_index)
                     .context("capture produced no DMA-BUF")?;
+                if keyframe_wanted.swap(false, Ordering::Relaxed) {
+                    tracing::info!("device rebuilt its decoder; forcing a keyframe");
+                    encoder.request_keyframe();
+                }
                 encoder.push_frame(dmabuf, slot * frame_duration_ns)?;
             }
             Ok(Exit::Stopped)
