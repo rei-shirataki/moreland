@@ -278,6 +278,11 @@ fn main() -> Result<()> {
     let mut devices: Vec<tracker::Device> = Vec::new();
     let mut consecutive_failures = 0u32;
     let mut announced_idle = false;
+    // The wireless device last streamed to, and when it was last asked to
+    // come back. A Wi-Fi drop removes it from the adb list for good unless
+    // something reconnects it.
+    let mut last_wireless: Option<String> = None;
+    let mut last_reconnect = std::time::Instant::now();
 
     while !shutdown.load(Ordering::Relaxed) {
         // Short timeout: absence of an update is normal and just means the
@@ -331,6 +336,19 @@ fn main() -> Result<()> {
                 }
                 announced_idle = true;
             }
+            if let Some(serial) = last_wireless.as_deref() {
+                if !control.is_stopped(serial)
+                    && !devices.iter().any(|d| d.serial == serial && d.is_ready())
+                    && last_reconnect.elapsed() >= WIRELESS_RECONNECT_INTERVAL
+                {
+                    last_reconnect = std::time::Instant::now();
+                    match transport::adb::reconnect_wireless(serial) {
+                        Ok(true) => tracing::debug!("asked adb to reconnect {serial}"),
+                        Ok(false) => {}
+                        Err(e) => tracing::debug!("wireless reconnect: {e:#}"),
+                    }
+                }
+            }
             continue;
         };
 
@@ -343,6 +361,7 @@ fn main() -> Result<()> {
             session_stop.store(true, Ordering::Relaxed);
         }
         tracing::info!("device {} connected", device.serial);
+        last_wireless = transport::adb::is_wireless(&device.serial).then(|| device.serial.clone());
         let outcome = session::run(&device.serial, &args.config, &session_stop);
         let stopped_by_command = control.end();
 
@@ -389,6 +408,9 @@ fn main() -> Result<()> {
     tracing::info!("shutting down");
     Ok(())
 }
+
+/// How often to ask adb to reconnect a wireless device that has dropped.
+const WIRELESS_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 fn sleep_with_shutdown(duration: Duration, shutdown: &AtomicBool) {
     let start = std::time::Instant::now();

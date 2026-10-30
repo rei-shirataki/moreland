@@ -446,26 +446,33 @@ impl VirtualOutput {
                 // outright — and refuses it on stdout with a zero exit
                 // status, so `run` reports success and the output silently
                 // keeps the compositor's defaults. Re-issue the same rule
-                // through `eval`, which that parser does accept.
-                let parser = if reply.contains("non-legacy parsers") {
-                    let lua = format!(
-                        "hl.monitor({{ output = {}, \
+                // through `eval`, which that parser does accept. Hyprland 0.57
+                // words the refusal as a bare "unknown request" instead.
+                let parser =
+                    if reply.contains("non-legacy parsers") || reply.contains("unknown request") {
+                        let lua = format!(
+                            "hl.monitor({{ output = {}, \
                          mode = \"{width}x{height}@{refresh}\", \
                          position = \"{x}x{y}\", scale = {scale} }})",
-                        lua_string(name)
-                    );
-                    run("hyprctl", &["eval", &lua])
-                        .with_context(|| format!("configuring output as {lua}"))?;
-                    HyprParser::Lua
-                } else {
-                    HyprParser::Legacy
-                };
+                            lua_string(name)
+                        );
+                        run("hyprctl", &["eval", &lua])
+                            .with_context(|| format!("configuring output as {lua}"))?;
+                        HyprParser::Lua
+                    } else {
+                        HyprParser::Legacy
+                    };
                 output.parser = parser;
 
                 restore_hyprland_monitor_state(&saved_states, name, parser)
                     .context("restoring Hyprland monitor state")?;
 
                 std::thread::sleep(std::time::Duration::from_millis(400));
+                if output.borrowed.is_none() {
+                    if let Err(e) = output.set_mode(width, height) {
+                        tracing::warn!("{e:#}");
+                    }
+                }
                 return Ok(output);
             }
             // Sway is UNTESTED and everything else is unsupported; both cases
@@ -491,6 +498,73 @@ impl VirtualOutput {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Issue the mode rule once. Hyprland can refuse on stdout with a zero
+    /// exit status, so the reply is checked as well as the exit code.
+    fn issue_mode(&self, width: u32, height: u32) -> Result<()> {
+        let (x, y) = self.position;
+        let refresh = self.refresh;
+        let scale = self.scale;
+        let name = &self.name;
+        let reply = match self.parser {
+            HyprParser::Legacy => {
+                let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},{scale}");
+                run("hyprctl", &["keyword", "monitor", &spec])
+                    .with_context(|| format!("resizing output as {spec}"))?
+            }
+            HyprParser::Lua => {
+                let lua = format!(
+                    "hl.monitor({{ output = {}, mode = \"{width}x{height}@{refresh}\", \
+                     position = \"{x}x{y}\", scale = {scale} }})",
+                    lua_string(name)
+                );
+                run("hyprctl", &["eval", &lua])
+                    .with_context(|| format!("resizing output as {lua}"))?
+            }
+        };
+        let reply = reply.trim();
+        if !reply.is_empty() && reply != "ok" {
+            bail!("hyprctl said {reply:?}");
+        }
+        Ok(())
+    }
+
+    /// Apply a mode and wait until the compositor reports it, retrying a
+    /// couple of times. A rule that is silently not applied leaves the output
+    /// at the wrong size, and the session would rebuild its pipeline forever
+    /// chasing the size the device asked for.
+    fn set_mode(&self, width: u32, height: u32) -> Result<()> {
+        for attempt in 1..=3 {
+            let issued = self.issue_mode(width, height);
+            if let Err(e) = &issued {
+                tracing::warn!("mode {width}x{height} not accepted (attempt {attempt}): {e:#}");
+            }
+            // Layer-shell clients (bars, overviews) re-lay themselves out only
+            // once the compositor has really switched mode, and capturing
+            // earlier streams a half-resized desktop. Wait for the mode, not a
+            // fixed time.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let applied = hyprland_monitor_state()
+                    .map(|all| {
+                        all.iter()
+                            .any(|m| m.name == self.name && m.width == width && m.height == height)
+                    })
+                    .unwrap_or(false);
+                if applied {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+        bail!(
+            "output {} did not switch to {width}x{height} after 3 attempts",
+            self.name
+        )
     }
 
     /// Bind an input device (a touchscreen) to this output, so its absolute
@@ -540,42 +614,7 @@ impl VirtualOutput {
                 self.name
             );
         }
-        let (x, y) = self.position;
-        let refresh = self.refresh;
-        let scale = self.scale;
-        let name = &self.name;
-        match self.parser {
-            HyprParser::Legacy => {
-                let spec = format!("{name},{width}x{height}@{refresh},{x}x{y},{scale}");
-                run("hyprctl", &["keyword", "monitor", &spec])
-                    .with_context(|| format!("resizing output as {spec}"))?;
-            }
-            HyprParser::Lua => {
-                let lua = format!(
-                    "hl.monitor({{ output = {}, mode = \"{width}x{height}@{refresh}\", \
-                     position = \"{x}x{y}\", scale = {scale} }})",
-                    lua_string(name)
-                );
-                run("hyprctl", &["eval", &lua])
-                    .with_context(|| format!("resizing output as {lua}"))?;
-            }
-        }
-        // Layer-shell clients (bars, overviews) re-lay themselves out only once
-        // the compositor has really switched mode, and capturing earlier
-        // streams a half-resized desktop. Wait for the mode, not a fixed time.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let applied = hyprland_monitor_state()
-                .map(|all| {
-                    all.iter()
-                        .any(|m| m.name == *name && m.width == width && m.height == height)
-                })
-                .unwrap_or(false);
-            if applied || std::time::Instant::now() >= deadline {
-                break;
-            }
-        }
+        self.set_mode(width, height)?;
         // Clients still need a moment to reconfigure to the new size.
         std::thread::sleep(std::time::Duration::from_millis(300));
         Ok(())
