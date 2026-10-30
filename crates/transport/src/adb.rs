@@ -68,6 +68,36 @@ pub fn is_wireless(serial: &str) -> bool {
     serial.contains("_adb-tls-connect") || serial.contains(':')
 }
 
+/// The `ip:port` a wireless device can be reached at, from the output of
+/// `adb mdns services`: one `name  type  ip:port` row per advertised service.
+fn parse_mdns_endpoint(out: &str, name: &str) -> Option<String> {
+    out.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let (service, kind, endpoint) = (fields.next()?, fields.next()?, fields.next()?);
+        (service == name && kind.starts_with("_adb-tls-connect")).then(|| endpoint.to_string())
+    })
+}
+
+/// Ask adb to reconnect a wireless device that has dropped off its list.
+///
+/// A Wi-Fi blip makes the device vanish from `adb devices` and nothing
+/// brings it back by itself. Returns whether a connect was attempted: false
+/// for a USB serial or a device that is not currently advertising.
+pub fn reconnect_wireless(serial: &str) -> Result<bool> {
+    let endpoint = if let Some((name, _)) = serial.split_once("._adb-tls-connect") {
+        match parse_mdns_endpoint(&adb(&["mdns", "services"])?, name) {
+            Some(endpoint) => endpoint,
+            None => return Ok(false),
+        }
+    } else if serial.contains(':') {
+        serial.to_string()
+    } else {
+        return Ok(false);
+    };
+    adb(&["connect", &endpoint])?;
+    Ok(true)
+}
+
 /// An `adb forward` rule, removed when dropped.
 ///
 /// The remote spec is a `localabstract:` socket in production so traffic never
@@ -296,15 +326,34 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_mdns_endpoint_of_a_device() {
+        let out = "List of discovered mdns services\n\
+                   adb-AAA-bbb\t_adb-tls-connect._tcp\t10.0.0.5:41186\n\
+                   adb-CCC-ddd\t_adb-tls-pairing._tcp\t10.0.0.6:40000\n";
+        assert_eq!(
+            parse_mdns_endpoint(out, "adb-AAA-bbb").as_deref(),
+            Some("10.0.0.5:41186")
+        );
+        // A pairing advertisement is not somewhere to connect to.
+        assert_eq!(parse_mdns_endpoint(out, "adb-CCC-ddd"), None);
+        assert_eq!(parse_mdns_endpoint(out, "adb-missing"), None);
+    }
+
+    #[test]
     fn tells_wireless_serials_from_usb() {
-        assert!(is_wireless("adb-V4QBB20507200467-4Rxq8Y._adb-tls-connect._tcp"));
+        assert!(is_wireless(
+            "adb-V4QBB20507200467-4Rxq8Y._adb-tls-connect._tcp"
+        ));
         assert!(is_wireless("192.168.0.5:5555"));
         assert!(!is_wireless("V4QBB20507200467"));
     }
 
     #[test]
     fn parses_rotation_numeric_and_symbolic() {
-        assert_eq!(parse_rotation("    mCurRotation=0 mOriginalRotation=1\n"), Some(0));
+        assert_eq!(
+            parse_rotation("    mCurRotation=0 mOriginalRotation=1\n"),
+            Some(0)
+        );
         assert_eq!(parse_rotation("mCurRotation=1 x"), Some(1));
         assert_eq!(parse_rotation("mCurRotation=ROTATION_90 x"), Some(1));
         assert_eq!(parse_rotation("mCurRotation=ROTATION_270"), Some(3));
