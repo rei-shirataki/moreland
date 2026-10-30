@@ -467,11 +467,15 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         ack_thread: Some(ack_thread),
     };
 
+    // Set when the compositor would not switch to the size the device asked
+    // for; without it the loop would rebuild the pipeline forever.
+    let rejected: std::cell::Cell<Option<(u32, u32)>> = std::cell::Cell::new(None);
+
     // The size the picture should have for the device's reported display, or
     // `None` when it is already that size, or when the compositor cannot resize.
     let wanted_size = |size: (u32, u32)| -> Option<(u32, u32)> {
         compute_wanted_size(
-            output.can_resize(),
+            output.can_resize() && rejected.get().is_none(),
             *reported.lock().unwrap(),
             config.resolution,
             config.max_width,
@@ -597,10 +601,11 @@ pub fn run(serial: &str, config: &Config, shutdown: &AtomicBool) -> Result<()> {
         );
         drop(capture);
         drop(encoder);
-        let rebuilt = (|| -> Result<(Capture, Arc<Encoder>)> {
-            output.resize(target.0, target.1)?;
-            build_pipeline()
-        })();
+        if let Err(e) = output.resize(target.0, target.1) {
+            tracing::warn!("{e:#}; keeping the current size");
+            rejected.set(Some(target));
+        }
+        let rebuilt = build_pipeline();
         match rebuilt {
             Ok((new_capture, new_encoder)) => {
                 capture = new_capture;
