@@ -446,20 +446,22 @@ impl VirtualOutput {
                 // outright — and refuses it on stdout with a zero exit
                 // status, so `run` reports success and the output silently
                 // keeps the compositor's defaults. Re-issue the same rule
-                // through `eval`, which that parser does accept.
-                let parser = if reply.contains("non-legacy parsers") {
-                    let lua = format!(
-                        "hl.monitor({{ output = {}, \
+                // through `eval`, which that parser does accept. Hyprland 0.57
+                // words the refusal as a bare "unknown request" instead.
+                let parser =
+                    if reply.contains("non-legacy parsers") || reply.contains("unknown request") {
+                        let lua = format!(
+                            "hl.monitor({{ output = {}, \
                          mode = \"{width}x{height}@{refresh}\", \
                          position = \"{x}x{y}\", scale = {scale} }})",
-                        lua_string(name)
-                    );
-                    run("hyprctl", &["eval", &lua])
-                        .with_context(|| format!("configuring output as {lua}"))?;
-                    HyprParser::Lua
-                } else {
-                    HyprParser::Legacy
-                };
+                            lua_string(name)
+                        );
+                        run("hyprctl", &["eval", &lua])
+                            .with_context(|| format!("configuring output as {lua}"))?;
+                        HyprParser::Lua
+                    } else {
+                        HyprParser::Legacy
+                    };
                 output.parser = parser;
 
                 restore_hyprland_monitor_state(&saved_states, name, parser)
@@ -547,9 +549,8 @@ impl VirtualOutput {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 let applied = hyprland_monitor_state()
                     .map(|all| {
-                        all.iter().any(|m| {
-                            m.name == self.name && m.width == width && m.height == height
-                        })
+                        all.iter()
+                            .any(|m| m.name == self.name && m.width == width && m.height == height)
                     })
                     .unwrap_or(false);
                 if applied {
